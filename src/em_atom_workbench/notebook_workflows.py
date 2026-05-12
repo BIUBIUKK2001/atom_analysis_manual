@@ -49,12 +49,25 @@ from .session import (
     PixelCalibration,
     RefinementConfig,
 )
+from .simple_quant import (
+    DirectionalSpacingTask,
+    LineGroupingTask,
+    PairDistanceTask,
+    assign_lines_by_projection,
+    compute_directional_spacing,
+    compute_line_spacing,
+    compute_pair_distances,
+    prepare_quant_points,
+    summarize_simple_quant_table,
+)
 from .utils import (
+    load_or_connect_session,
     save_active_session,
     save_checkpoint,
     stage_rank,
     synthetic_gaussian_image,
     synthetic_hfo2_multichannel_bundle,
+    write_json,
 )
 
 
@@ -178,6 +191,237 @@ def metadata_preview(session: AnalysisSession, max_rows: int = 12) -> pd.DataFra
             "value": [str(session.raw_metadata[key])[:160] for key in keys[:max_rows]],
         }
     )
+
+
+def _simple_quant_stage_summary(
+    session: AnalysisSession,
+    quant_points: pd.DataFrame,
+    *,
+    source_table: str,
+    output_dir: Path,
+) -> pd.DataFrame:
+    rows = [
+        {"field": "session_name", "value": session.name},
+        {"field": "current_stage", "value": session.current_stage},
+        {"field": "primary_channel", "value": session.primary_channel},
+        {"field": "source_table", "value": source_table},
+        {"field": "quant_point_count", "value": len(quant_points)},
+        {"field": "class_count", "value": int(quant_points["class_id"].nunique(dropna=True)) if "class_id" in quant_points else 0},
+        {"field": "pixel_size", "value": session.pixel_calibration.size},
+        {"field": "unit", "value": session.pixel_calibration.unit},
+        {"field": "output_dir", "value": str(output_dir)},
+    ]
+    return pd.DataFrame(rows)
+
+
+def _simple_quant_output_dirs(result_root: str | Path) -> dict[str, Path]:
+    output_dir = Path(result_root) / "02_simple_quant"
+    dirs = {
+        "output": output_dir,
+        "tables": output_dir / "tables",
+        "figures": output_dir / "figures",
+        "configs": output_dir / "configs",
+        "session": output_dir / "session",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def _resolve_simple_quant_image(
+    session: AnalysisSession,
+    *,
+    image_channel: str | None,
+    image_key: str,
+) -> tuple[np.ndarray, str, str]:
+    channel_name = image_channel or session.primary_channel
+    key = str(image_key).lower()
+    if key == "raw":
+        image = session.get_channel_state(channel_name).raw_image
+        if image is None:
+            raise ValueError(f"Raw image is not available for channel {channel_name!r}.")
+        return image, channel_name, key
+    if key == "processed":
+        return session.get_processed_image(channel_name), channel_name, key
+    raise ValueError("image_key must be 'raw' or 'processed'.")
+
+
+def initialize_simple_quant_analysis(
+    *,
+    session_path: str | Path | None,
+    result_root: str | Path,
+    source_table: str,
+    use_keep_only: bool,
+    class_filter: tuple[str, ...] | list[str] | set[str] | None,
+    class_id_filter: tuple[int, ...] | list[int] | set[int] | None,
+    roi: tuple[float, float, float, float] | None,
+    image_channel: str | None,
+    image_key: str,
+) -> dict[str, Any]:
+    session = load_or_connect_session(result_root, session_path=session_path)
+    quant_points = prepare_quant_points(
+        session,
+        source_table=source_table,
+        use_keep_only=use_keep_only,
+        class_filter=class_filter,
+        class_id_filter=class_id_filter,
+        roi=roi,
+    )
+    image, resolved_channel, resolved_image_key = _resolve_simple_quant_image(
+        session,
+        image_channel=image_channel,
+        image_key=image_key,
+    )
+    output_dirs = _simple_quant_output_dirs(result_root)
+    summary = _simple_quant_stage_summary(
+        session,
+        quant_points,
+        source_table=source_table,
+        output_dir=output_dirs["output"],
+    )
+    return {
+        "session": session,
+        "quant_points": quant_points,
+        "image": image,
+        "image_channel": resolved_channel,
+        "image_key": resolved_image_key,
+        "output_dirs": output_dirs,
+        "summary_tables": {
+            "simple_quant_summary": summary,
+            "quant_points_preview": quant_points.head(),
+        },
+    }
+
+
+def run_directional_spacing_analysis(
+    quant_points: pd.DataFrame,
+    direction_table: pd.DataFrame,
+    tasks: tuple[DirectionalSpacingTask, ...] | list[DirectionalSpacingTask],
+) -> dict[str, pd.DataFrame]:
+    table = compute_directional_spacing(quant_points, direction_table, tasks)
+    value_column = "distance_pm" if not table.empty and table["distance_pm"].notna().any() else "distance_px"
+    summary = summarize_simple_quant_table(table, ["measurement_name", "direction_name"], value_column)
+    return {"directional_spacing_table": table, "directional_spacing_summary": summary}
+
+
+def run_pair_distance_analysis(
+    quant_points: pd.DataFrame,
+    direction_table: pd.DataFrame,
+    tasks: tuple[PairDistanceTask, ...] | list[PairDistanceTask],
+) -> dict[str, pd.DataFrame]:
+    table = compute_pair_distances(quant_points, tasks, direction_table=direction_table)
+    value_column = "distance_pm" if not table.empty and table["distance_pm"].notna().any() else "distance_px"
+    summary = summarize_simple_quant_table(table, ["pair_name"], value_column)
+    return {"pair_distance_table": table, "pair_distance_summary": summary}
+
+
+def run_line_spacing_analysis(
+    quant_points: pd.DataFrame,
+    direction_table: pd.DataFrame,
+    tasks: tuple[LineGroupingTask, ...] | list[LineGroupingTask],
+) -> dict[str, pd.DataFrame]:
+    assignment_tables: list[pd.DataFrame] = []
+    spacing_tables: list[pd.DataFrame] = []
+    for task in tasks:
+        assignments = assign_lines_by_projection(quant_points, direction_table, task)
+        assignment_tables.append(assignments)
+        spacing_tables.append(compute_line_spacing(quant_points, assignments, direction_table, task))
+    line_assignments = pd.concat(assignment_tables, ignore_index=True) if assignment_tables else pd.DataFrame()
+    line_spacing = pd.concat(spacing_tables, ignore_index=True) if spacing_tables else pd.DataFrame()
+    if line_spacing.empty:
+        line_summary = pd.DataFrame()
+    else:
+        line_summary = (
+            line_spacing.groupby(["line_task_name", "direction_name", "group_axis", "line_id"], dropna=False)
+            .agg(
+                line_atom_count=("atom_id", "count"),
+                line_center_px=("line_center_px", "first"),
+                line_width_px=("line_width_px", "first"),
+                line_width_nm=("line_width_nm", "first"),
+                line_width_pm=("line_width_pm", "first"),
+                line_mean_spacing_px=("line_mean_spacing_px", "first"),
+                line_mean_spacing_pm=("line_mean_spacing_pm", "first"),
+                line_std_spacing_px=("line_std_spacing_px", "first"),
+                line_std_spacing_pm=("line_std_spacing_pm", "first"),
+            )
+            .reset_index()
+        )
+    return {
+        "line_assignments": line_assignments,
+        "line_spacing_table": line_spacing,
+        "line_summary": line_summary,
+    }
+
+
+def _save_simple_quant_figures(figures: dict[str, Any], figures_dir: Path) -> dict[str, list[str]]:
+    saved: dict[str, list[str]] = {}
+    for stem, figure in figures.items():
+        if figure is None:
+            continue
+        paths: list[str] = []
+        for suffix in ("pdf", "png", "svg"):
+            target = figures_dir / f"{stem}.{suffix}"
+            figure.savefig(target, bbox_inches="tight", dpi=300)
+            paths.append(str(target))
+        saved[str(stem)] = paths
+    return saved
+
+
+def export_simple_quant_analysis(
+    *,
+    session: AnalysisSession,
+    output_dirs: dict[str, Path] | None = None,
+    result_root: str | Path | None = None,
+    tables: dict[str, pd.DataFrame],
+    figures: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
+    direction_table: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    dirs = output_dirs or _simple_quant_output_dirs(result_root or "results")
+    table_paths: dict[str, str] = {}
+    for name, table in tables.items():
+        if table is None:
+            continue
+        target = dirs["tables"] / f"{name}.csv"
+        table.to_csv(target, index=False)
+        table_paths[str(name)] = str(target)
+
+    figure_paths = _save_simple_quant_figures(figures or {}, dirs["figures"])
+    config_path = write_json(dirs["configs"] / "simple_quant_config.json", dict(config or {}))
+    direction_path = write_json(
+        dirs["configs"] / "directions.json",
+        {
+            "direction_table": []
+            if direction_table is None
+            else direction_table.to_dict(orient="records"),
+        },
+    )
+    manifest = {
+        "workflow": "simple_quant",
+        "output_dir": str(dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "configs": {
+            "simple_quant_config": str(config_path),
+            "directions": str(direction_path),
+        },
+    }
+    manifest_path = write_json(dirs["output"] / "manifest.json", manifest)
+
+    session.annotations["simple_quant"] = {
+        "output_dir": str(dirs["output"]),
+        "source_table": (config or {}).get("source_table"),
+        "use_keep_only": (config or {}).get("use_keep_only"),
+        "class_filter": (config or {}).get("class_filter"),
+        "class_id_filter": (config or {}).get("class_id_filter"),
+        "roi": (config or {}).get("roi"),
+        "tables": table_paths,
+    }
+    session.set_stage("simple_quant")
+    checkpoint_path = session.save_pickle(dirs["session"] / "02_simple_quant_session.pkl")
+    manifest["manifest"] = str(manifest_path)
+    manifest["session_checkpoint"] = str(checkpoint_path)
+    return manifest
 
 
 def generic_stage_summary(session: AnalysisSession, active_path: Path | None) -> pd.DataFrame:
