@@ -1,0 +1,1062 @@
+"""Small notebook orchestration helpers.
+
+These functions keep the notebooks focused on parameters and stage calls while
+leaving repetitive validation, display, plotting, and active-session updates in
+one place.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from .classification import (
+    AtomColumnClassificationConfig,
+    apply_class_name_map,
+    apply_class_review_from_viewer,
+    classification_summary_table,
+    classify_atom_columns,
+    launch_class_review_napari,
+)
+from .curate import (
+    curate_points,
+    edit_candidates_with_napari,
+    edit_hfo2_heavy_candidates_with_napari,
+    edit_hfo2_light_candidates_with_napari,
+)
+from .detect import detect_hfo2_heavy_candidates, detect_hfo2_light_candidates, detect_multichannel_candidates
+from .io import load_image_bundle
+from .plotting import (
+    launch_detection_napari_viewer,
+    launch_refinement_napari_viewer,
+    plot_class_feature_scatter_matrix,
+    plot_class_overlay,
+    plot_atom_overlay,
+    plot_histogram_or_distribution,
+    plot_raw_image,
+)
+from .refine import refine_points, refine_points_by_class
+from .session import (
+    AnalysisSession,
+    CurationConfig,
+    DetectionConfig,
+    HfO2MultichannelDetectionConfig,
+    PixelCalibration,
+    RefinementConfig,
+)
+from .utils import (
+    save_active_session,
+    save_checkpoint,
+    stage_rank,
+    synthetic_gaussian_image,
+    synthetic_hfo2_multichannel_bundle,
+)
+
+
+@dataclass(frozen=True)
+class HfO2Channels:
+    primary: str
+    heavy: str
+    light: str
+    confirm: str | None = None
+
+
+@dataclass
+class NotebookResult:
+    session: AnalysisSession | None = None
+    active_path: Path | None = None
+    tables: list[pd.DataFrame] = field(default_factory=list)
+    figures: list[Any] = field(default_factory=list)
+    messages: list[str] = field(default_factory=list)
+
+
+def display_notebook_result(result: NotebookResult) -> None:
+    """Display tables and figures from a notebook stage result."""
+    try:
+        from IPython.display import display
+    except Exception:  # pragma: no cover - notebooks normally have IPython.
+        display = print
+
+    for table in result.tables:
+        display(table)
+    for figure in result.figures:
+        display(figure)
+        plt.close(figure)
+    for message in result.messages:
+        print(message)
+
+
+def filter_points_by_role(points: pd.DataFrame, role: str) -> pd.DataFrame:
+    if points is None or len(points) == 0:
+        return pd.DataFrame()
+    if "column_role" not in points.columns:
+        return points.copy() if role == "light_atom" else points.iloc[0:0].copy()
+    return points.loc[points["column_role"] == role].copy()
+
+
+def workflow_channels(session: AnalysisSession) -> HfO2Channels:
+    settings = dict(session.workflow_settings or {})
+    primary = str(settings.get("primary_channel") or session.primary_channel)
+    heavy = settings.get("heavy_channel")
+    light = settings.get("light_channel")
+    confirm = settings.get("confirm_channel")
+
+    if primary != "idpc":
+        raise ValueError("hfo2_multichannel requires the primary channel to be 'idpc'.")
+    missing = [
+        name
+        for name in (heavy, light)
+        if not isinstance(name, str) or name not in session.list_channels()
+    ]
+    if missing:
+        raise ValueError(f"Missing required HfO2 channels: {missing}")
+    if confirm is not None and confirm not in session.list_channels():
+        raise ValueError(f"Unknown confirm channel: {confirm!r}")
+    return HfO2Channels(primary=primary, heavy=str(heavy), light=str(light), confirm=confirm)
+
+
+def hfo2_stage_summary(session: AnalysisSession, active_path: Path | None) -> pd.DataFrame:
+    heavy = filter_points_by_role(session.candidate_points, "heavy_atom")
+    light = filter_points_by_role(session.candidate_points, "light_atom")
+    rows = [
+        {"field": "session_name", "value": session.name},
+        {"field": "input_path", "value": session.input_path or "synthetic_multichannel_demo"},
+        {"field": "dataset_index", "value": session.dataset_index},
+        {"field": "pixel_size", "value": session.pixel_calibration.size},
+        {"field": "unit", "value": session.pixel_calibration.unit},
+        {"field": "calibration_source", "value": session.pixel_calibration.source},
+        {"field": "workflow_mode", "value": session.workflow_mode},
+        {"field": "current_stage", "value": session.current_stage},
+        {"field": "heavy_count", "value": len(heavy)},
+        {"field": "light_count", "value": len(light)},
+        {"field": "candidate_count", "value": len(session.candidate_points)},
+        {"field": "refined_count", "value": len(session.refined_points)},
+        {"field": "curated_count", "value": len(session.curated_points)},
+        {"field": "active_session", "value": "" if active_path is None else str(active_path)},
+    ]
+    return pd.DataFrame(rows)
+
+
+def channel_summary(session: AnalysisSession) -> pd.DataFrame:
+    rows = []
+    for channel_name in session.list_channels():
+        state = session.get_channel_state(channel_name)
+        rows.append(
+            {
+                "channel": channel_name,
+                "is_primary": channel_name == session.primary_channel,
+                "input_path": state.input_path,
+                "dataset_index": state.dataset_index,
+                "contrast_mode": state.contrast_mode,
+                "raw_shape": None if state.raw_image is None else tuple(state.raw_image.shape),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def hfo2_channel_summary(session: AnalysisSession) -> pd.DataFrame:
+    return channel_summary(session)
+
+
+def _plot_calibration_kwargs(session: AnalysisSession) -> dict[str, Any]:
+    calibration = session.pixel_calibration
+    return {"pixel_size": calibration.size, "unit": calibration.unit, "target_unit": "nm"}
+
+
+def metadata_preview(session: AnalysisSession, max_rows: int = 12) -> pd.DataFrame:
+    if not session.raw_metadata:
+        return pd.DataFrame(columns=["key", "value"])
+    keys = list(session.raw_metadata.keys())
+    return pd.DataFrame(
+        {
+            "key": keys[:max_rows],
+            "value": [str(session.raw_metadata[key])[:160] for key in keys[:max_rows]],
+        }
+    )
+
+
+def generic_stage_summary(session: AnalysisSession, active_path: Path | None) -> pd.DataFrame:
+    table = session.get_atom_table(preferred="curated")
+    class_count = int(table["class_id"].nunique(dropna=True)) if "class_id" in table.columns else 0
+    rows = [
+        {"field": "session_name", "value": session.name},
+        {"field": "input_path", "value": session.input_path or "synthetic_generic_demo"},
+        {"field": "dataset_index", "value": session.dataset_index},
+        {"field": "pixel_size", "value": session.pixel_calibration.size},
+        {"field": "unit", "value": session.pixel_calibration.unit},
+        {"field": "workflow_mode", "value": session.workflow_mode},
+        {"field": "current_stage", "value": session.current_stage},
+        {"field": "channel_count", "value": len(session.list_channels())},
+        {"field": "candidate_count", "value": len(session.candidate_points)},
+        {"field": "refined_count", "value": len(session.refined_points)},
+        {"field": "classified_count", "value": len(table) if "class_id" in table.columns else 0},
+        {"field": "class_count", "value": class_count},
+        {"field": "curated_count", "value": len(session.curated_points)},
+        {"field": "active_session", "value": "" if active_path is None else str(active_path)},
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_synthetic_generic_class_session(*, rng_seed: int = 11) -> AnalysisSession:
+    rng = np.random.default_rng(rng_seed)
+    shape = (128, 128)
+    spacing = 16.0
+    peaks_a: list[dict[str, float]] = []
+    peaks_b: list[dict[str, float]] = []
+    coords: list[dict[str, float | int]] = []
+    class_index = 0
+    for row_idx, y in enumerate(np.arange(spacing, shape[0] - spacing / 2, spacing)):
+        for col_idx, x in enumerate(np.arange(spacing, shape[1] - spacing / 2, spacing)):
+            class_index = int((row_idx + col_idx) % 3)
+            x_j = float(x + rng.normal(0.0, 0.2))
+            y_j = float(y + rng.normal(0.0, 0.2))
+            amp0 = (0.65, 1.05, 1.45)[class_index]
+            amp1 = (1.35, 0.95, 0.55)[class_index]
+            sigma = (1.0, 1.25, 1.55)[class_index]
+            peaks_a.append({"x": x_j, "y": y_j, "amplitude": amp0, "sigma_x": sigma, "sigma_y": sigma})
+            peaks_b.append({"x": x_j, "y": y_j, "amplitude": amp1, "sigma_x": sigma, "sigma_y": sigma})
+            coords.append({"x_px": x_j, "y_px": y_j, "truth_class_id": class_index})
+    image_a = synthetic_gaussian_image(shape, peaks_a, background=0.06, noise_sigma=0.012, rng_seed=rng_seed)
+    image_b = synthetic_gaussian_image(shape, peaks_b, background=0.05, noise_sigma=0.012, rng_seed=rng_seed + 1)
+    session = AnalysisSession(
+        name="synthetic_generic_atom_columns",
+        raw_image=image_a,
+        raw_metadata={"source": "synthetic_generic_atom_columns", "truth": pd.DataFrame(coords).to_dict("records")},
+        pixel_calibration=PixelCalibration(size=0.2, unit="A", source="synthetic_demo"),
+        contrast_mode="bright_peak",
+        primary_channel="channel_0",
+    )
+    session.set_channel_state(
+        "channel_0",
+        input_path="synthetic://channel_0",
+        raw_image=image_a,
+        raw_metadata={"source": "synthetic_generic_atom_columns", "channel": "channel_0"},
+        contrast_mode="bright_peak",
+    )
+    session.set_channel_state(
+        "channel_1",
+        input_path="synthetic://channel_1",
+        raw_image=image_b,
+        raw_metadata={"source": "synthetic_generic_atom_columns", "channel": "channel_1"},
+        contrast_mode="bright_peak",
+    )
+    session.set_primary_channel("channel_0")
+    session.set_stage("loaded")
+    session.record_step(
+        "load_synthetic_generic_atom_columns",
+        notes={"truth_class_count": 3, "truth_count": len(coords)},
+    )
+    return session
+
+
+def initialize_generic_classification_session(
+    *,
+    result_root: str | Path,
+    channels: dict[str, str | Path | None],
+    primary_channel: str,
+    channel_contrast_modes: dict[str, str] | None = None,
+    channel_dataset_indices: dict[str, int | None] | None = None,
+    manual_calibration: PixelCalibration | dict[str, Any] | float | None = None,
+    synthetic_rng_seed: int = 11,
+) -> NotebookResult:
+    result_root = Path(result_root)
+    path_map = {str(name): path for name, path in dict(channels or {}).items() if path}
+    if not path_map:
+        session = build_synthetic_generic_class_session(rng_seed=synthetic_rng_seed)
+        primary_channel = session.primary_channel
+    else:
+        if primary_channel not in path_map:
+            raise KeyError(f"PRIMARY_CHANNEL {primary_channel!r} was not found in CHANNELS.")
+        missing = [str(path) for path in path_map.values() if not Path(path).exists()]
+        if missing:
+            raise FileNotFoundError("Missing channel input files:\n" + "\n".join(missing))
+        session = load_image_bundle(
+            path_map,
+            primary_channel=primary_channel,
+            manual_calibration=manual_calibration,
+            contrast_modes=dict(channel_contrast_modes or {}),
+            dataset_indices=dict(channel_dataset_indices or {}),
+        )
+    session.set_workflow(
+        "atom_column_classification",
+        {
+            "primary_channel": primary_channel,
+            "channel_names": session.list_channels(),
+            "channel_contrast_modes": {
+                name: session.get_channel_state(name).contrast_mode for name in session.list_channels()
+            },
+        },
+    )
+    active_path = save_active_session(session, result_root)
+    figures = []
+    channel_names = session.list_channels()
+    fig, axes = plt.subplots(1, len(channel_names), figsize=(5.0 * len(channel_names), 4.5))
+    axes = [axes] if len(channel_names) == 1 else list(axes)
+    for axis, channel_name in zip(axes, channel_names, strict=True):
+        plot_raw_image(
+            session.get_channel_state(channel_name).raw_image,
+            title=f"{channel_name} raw",
+            ax=axis,
+            **_plot_calibration_kwargs(session),
+        )
+    fig.tight_layout()
+    figures.append(fig)
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[generic_stage_summary(session, active_path), metadata_preview(session), channel_summary(session)],
+        figures=figures,
+        messages=[
+            f"session: {session.name}",
+            f"workflow_mode: {session.workflow_mode}",
+            f"current_stage: {session.current_stage}",
+            f"primary_channel: {session.primary_channel}",
+            f"active_session: {active_path}",
+        ],
+    )
+
+
+def run_generic_candidate_detection(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    detection_configs_by_channel: dict[str, DetectionConfig],
+    merge_dedupe_radius_px: float | None = None,
+    open_viewer: bool = False,
+) -> NotebookResult:
+    _require_generic_classification_session(session)
+    _clear_preprocess_results(session, list(detection_configs_by_channel.keys()))
+    session = detect_multichannel_candidates(
+        session,
+        detection_configs_by_channel,
+        dedupe_radius_px=merge_dedupe_radius_px,
+    )
+    fig, _ = plot_atom_overlay(
+        session.get_processed_image(session.primary_channel),
+        session.candidate_points,
+        title="候选原子柱总览",
+        origin_xy=session.get_processed_origin(session.primary_channel),
+        point_size=12.0,
+        **_plot_calibration_kwargs(session),
+    )
+    messages = []
+    if open_viewer:
+        try:
+            viewer = launch_detection_napari_viewer(session, show_raw_layer=False)
+            viewer.show(block=True)
+            messages.append("候选点只读 napari 总览已关闭。")
+        except Exception as exc:
+            messages.append(f"候选点 napari 总览失败: {type(exc).__name__}: {exc}")
+    active_path = save_active_session(session, result_root)
+    messages.append(f"candidate_count: {len(session.candidate_points)}")
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[generic_stage_summary(session, active_path)],
+        figures=[fig],
+        messages=messages,
+    )
+
+
+def review_generic_candidates(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    open_viewer: bool = False,
+    image_channel: str | None = None,
+    image_key: str = "processed",
+    point_size: float = 6.0,
+) -> NotebookResult:
+    _require_generic_classification_session(session)
+    if session.candidate_points.empty:
+        raise RuntimeError("candidate_points are missing; run candidate detection before candidate review.")
+    if not open_viewer:
+        return NotebookResult(
+            session=session,
+            messages=[
+                "Set OPEN_CANDIDATE_REVIEW_VIEWER = True, run the napari candidate review cell, "
+                "then continue to classification."
+            ],
+        )
+    channel_name = image_channel or session.primary_channel
+    try:
+        previous_count = len(session.candidate_points)
+        session = edit_candidates_with_napari(
+            session,
+            image_key=image_key,
+            channel_name=channel_name,
+            point_size=point_size,
+        )
+        if image_key == "processed":
+            display_image = session.get_processed_image(channel_name)
+            origin_xy = session.get_processed_origin(channel_name)
+        else:
+            display_image = session.get_channel_state(channel_name).raw_image
+            origin_xy = (0, 0)
+        fig, _ = plot_atom_overlay(
+            display_image,
+            session.candidate_points,
+            title="人工复核后的候选原子柱",
+            origin_xy=origin_xy,
+            point_size=12.0,
+            point_color="#00d7ff",
+            **_plot_calibration_kwargs(session),
+        )
+        active_path = save_active_session(session, result_root)
+        return NotebookResult(
+            session=session,
+            active_path=active_path,
+            tables=[generic_stage_summary(session, active_path), session.candidate_points.head()],
+            figures=[fig],
+            messages=[
+                "Candidate review viewer closed and edits were applied.",
+                f"candidate_count: {previous_count} -> {len(session.candidate_points)}",
+            ],
+        )
+    except Exception as exc:
+        return NotebookResult(session=session, messages=[f"Candidate review failed: {type(exc).__name__}: {exc}"])
+
+
+def run_generic_refinement(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    refinement_config: RefinementConfig,
+    class_refinement_overrides: dict[int | str, RefinementConfig | dict[str, object]] | None = None,
+    source_table: str = "candidate",
+    nn_context_mode: str = "all",
+) -> NotebookResult:
+    _require_generic_classification_session(session)
+    if session.candidate_points.empty:
+        raise RuntimeError("candidate_points are missing; run candidate detection first.")
+    if stage_rank(session.current_stage) < stage_rank("candidate_reviewed"):
+        raise RuntimeError(
+            "candidate_points must be reviewed in napari before refinement. "
+            "Run the candidate review stage with OPEN_CANDIDATE_REVIEW_VIEWER = True."
+        )
+    if stage_rank(session.current_stage) < stage_rank("classified"):
+        raise RuntimeError(
+            "candidate_points must be classified and class-reviewed before refinement. "
+            "Run candidate review, automatic classification, and class review first."
+        )
+    if "class_id" not in session.candidate_points.columns:
+        raise RuntimeError("class_id is missing; run atom-column classification before refinement.")
+    _clear_preprocess_results(session, session.list_channels())
+    session.clear_downstream_results("classified")
+    session = refine_points_by_class(
+        session,
+        refinement_config,
+        class_refinement_overrides,
+        source_table=source_table,
+        nn_context_mode=nn_context_mode,
+    )
+    fig, _ = plot_atom_overlay(
+        session.get_processed_image(session.primary_channel),
+        session.refined_points,
+        title="按类别精修后的原子柱坐标",
+        origin_xy=session.get_processed_origin(session.primary_channel),
+        point_size=12.0,
+        point_color="#f18f01",
+        **_plot_calibration_kwargs(session),
+    )
+    active_path = save_active_session(session, result_root)
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[generic_stage_summary(session, active_path), session.refined_points.head()],
+        figures=[fig],
+        messages=[
+            f"refined_count: {len(session.refined_points)}",
+            f"refinement_config_sources: {sorted(session.refined_points['refinement_config_source'].dropna().unique().tolist())}",
+            f"nn_context_mode: {nn_context_mode}",
+        ],
+    )
+
+
+def run_atom_column_classification(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    classification_config: AtomColumnClassificationConfig,
+    class_name_map: dict[int | str, str] | None = None,
+    class_color_map: dict[int | str, str] | None = None,
+) -> NotebookResult:
+    _require_generic_classification_session(session)
+    if str(classification_config.source_table).lower() == "candidate":
+        session.clear_downstream_results("detect")
+    session = classify_atom_columns(session, classification_config)
+    session = apply_class_name_map(session, class_name_map, class_color_map)
+    points = session.candidate_points if str(classification_config.source_table).lower() == "candidate" else (
+        session.refined_points if not session.refined_points.empty else session.candidate_points
+    )
+    overlay_fig, _ = plot_class_overlay(
+        session.get_processed_image(session.primary_channel),
+        points,
+        title="自动聚类类别叠加图",
+        origin_xy=session.get_processed_origin(session.primary_channel),
+        point_size=16.0,
+        **_plot_calibration_kwargs(session),
+    )
+    figures = [overlay_fig]
+    try:
+        scatter_fig, _ = plot_class_feature_scatter_matrix(session.classification_features, points)
+        figures.append(scatter_fig)
+    except Exception:
+        pass
+    active_path = save_active_session(session, result_root)
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[
+            generic_stage_summary(session, active_path),
+            classification_summary_table(session),
+            session.classification_features.head(),
+        ],
+        figures=figures,
+        messages=[f"classified_count: {len(points)}"],
+    )
+
+
+def run_generic_curation(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    curation_config: CurationConfig,
+) -> NotebookResult:
+    _require_generic_classification_session(session)
+    if "class_id" not in session.get_atom_table(preferred="refined").columns:
+        raise RuntimeError("class_id is missing; run atom-column classification before final curation.")
+    session = curate_points(session, curation_config)
+    display_points = session.curated_points.query("keep == True") if "keep" in session.curated_points.columns else session.curated_points
+    fig, _ = plot_class_overlay(
+        session.get_processed_image(session.primary_channel),
+        display_points if not display_points.empty else session.curated_points,
+        title="最终保留原子柱类别叠加图",
+        origin_xy=session.get_processed_origin(session.primary_channel),
+        point_size=16.0,
+        **_plot_calibration_kwargs(session),
+    )
+    active_path = save_active_session(session, result_root)
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[generic_stage_summary(session, active_path), classification_summary_table(session), session.curated_points.head()],
+        figures=[fig],
+        messages=[f"curated_count: {len(session.curated_points)}", f"auto_keep_count: {len(display_points)}"],
+    )
+
+
+def show_atom_column_class_review(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path | None = None,
+    open_viewer: bool = False,
+    image_channel: str | None = None,
+    point_size: float = 6.0,
+    source_table: str = "refined",
+) -> NotebookResult:
+    _require_generic_classification_session(session)
+    if not open_viewer:
+        return NotebookResult(session=session, messages=["Set OPEN_CLASS_REVIEW_VIEWER = True to open napari class review."])
+    try:
+        viewer = launch_class_review_napari(
+            session,
+            image_channel=image_channel,
+            point_size=point_size,
+            source_table=source_table,
+        )
+        viewer.show(block=True)
+        session = apply_class_review_from_viewer(session, viewer, source_table=source_table)
+        active_path = save_active_session(session, result_root) if result_root is not None else None
+        return NotebookResult(session=session, active_path=active_path, messages=["Class review viewer closed and edits were applied."])
+    except Exception as exc:
+        return NotebookResult(session=session, messages=[f"Class review viewer failed: {type(exc).__name__}: {exc}"])
+
+
+def initialize_hfo2_multichannel_session(
+    *,
+    result_root: str | Path,
+    idpc_path: str | Path | None,
+    haadf_path: str | Path | None,
+    abf_path: str | Path | None = None,
+    channel_dataset_indices: dict[str, int | None] | None = None,
+    bundle_manual_calibration: PixelCalibration | dict[str, Any] | float | None = None,
+    primary_channel: str = "idpc",
+    synthetic_include_abf: bool = True,
+    synthetic_rng_seed: int = 11,
+) -> NotebookResult:
+    if primary_channel != "idpc":
+        raise ValueError("hfo2_multichannel requires PRIMARY_CHANNEL = 'idpc'.")
+
+    result_root = Path(result_root)
+    if idpc_path is None and haadf_path is None:
+        session = build_synthetic_hfo2_session(
+            include_abf=synthetic_include_abf,
+            rng_seed=synthetic_rng_seed,
+        )
+    else:
+        session = _load_real_hfo2_session(
+            idpc_path=idpc_path,
+            haadf_path=haadf_path,
+            abf_path=abf_path,
+            channel_dataset_indices=channel_dataset_indices,
+            bundle_manual_calibration=bundle_manual_calibration,
+            primary_channel=primary_channel,
+        )
+
+    session.set_primary_channel("idpc")
+    session.set_workflow(
+        "hfo2_multichannel",
+        {
+            "primary_channel": "idpc",
+            "heavy_channel": "haadf",
+            "light_channel": "idpc",
+            "confirm_channel": "abf" if "abf" in session.list_channels() else None,
+        },
+    )
+    active_path = save_active_session(session, result_root)
+
+    figures = []
+    channel_names = session.list_channels()
+    fig, axes = plt.subplots(1, len(channel_names), figsize=(5.2 * len(channel_names), 4.8))
+    axes = [axes] if len(channel_names) == 1 else list(axes)
+    for axis, channel_name in zip(axes, channel_names, strict=True):
+        plot_raw_image(
+            session.get_channel_state(channel_name).raw_image,
+            title=f"{channel_name.upper()} raw image",
+            ax=axis,
+            **_plot_calibration_kwargs(session),
+        )
+    plt.tight_layout()
+    figures.append(fig)
+
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[
+            hfo2_stage_summary(session, active_path),
+            metadata_preview(session),
+            hfo2_channel_summary(session),
+        ],
+        figures=figures,
+        messages=[
+            f"session: {session.name}",
+            f"workflow_mode: {session.workflow_mode}",
+            f"current_stage: {session.current_stage}",
+            f"primary_channel: {session.primary_channel}",
+            f"active_session: {active_path}",
+        ],
+    )
+
+
+def build_synthetic_hfo2_session(*, include_abf: bool = True, rng_seed: int = 11) -> AnalysisSession:
+    images, truth = synthetic_hfo2_multichannel_bundle(include_abf=include_abf, rng_seed=rng_seed)
+    session = AnalysisSession(
+        name="synthetic_multichannel_demo",
+        raw_image=images["idpc"],
+        raw_metadata={
+            "source": "synthetic_hfo2_multichannel_demo",
+            "heavy_truth_count": len(truth["heavy"]),
+            "light_truth_count": len(truth["light"]),
+            "rng_seed": rng_seed,
+        },
+        pixel_calibration=PixelCalibration(size=0.2, unit="A", source="synthetic_demo"),
+        contrast_mode="bright_peak",
+        primary_channel="idpc",
+    )
+    for channel_name, image in images.items():
+        session.set_channel_state(
+            channel_name,
+            input_path=f"synthetic://{channel_name}",
+            raw_image=image,
+            raw_metadata={"source": "synthetic_hfo2_multichannel_demo", "channel": channel_name},
+            contrast_mode="dark_dip" if channel_name == "abf" else "bright_peak",
+        )
+    session.set_primary_channel("idpc")
+    session.set_stage("loaded")
+    session.record_step(
+        "load_synthetic_hfo2_multichannel_demo",
+        notes={
+            "heavy_truth_count": len(truth["heavy"]),
+            "light_truth_count": len(truth["light"]),
+            "include_abf": bool(include_abf),
+        },
+    )
+    return session
+
+
+def run_hfo2_heavy_detection(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    heavy_detection: DetectionConfig,
+    open_viewer: bool = False,
+) -> NotebookResult:
+    _require_hfo2_session(session)
+    channels = workflow_channels(session)
+    config = HfO2MultichannelDetectionConfig(
+        heavy_channel=channels.heavy,
+        light_channel=channels.light,
+        confirm_channel=channels.confirm,
+        heavy_detection=heavy_detection,
+    )
+
+    _clear_preprocess_results(session, [channels.heavy])
+    session = detect_hfo2_heavy_candidates(session, config)
+    heavy_points = filter_points_by_role(session.candidate_points, "heavy_atom")
+    if heavy_points.empty:
+        heavy_points = session.candidate_points.copy()
+
+    fig, _ = plot_atom_overlay(
+        session.get_processed_image(channels.heavy),
+        heavy_points,
+        title="HAADF heavy-column candidates",
+        origin_xy=session.get_processed_origin(channels.heavy),
+        point_size=14.0,
+        point_color="#ff8c00",
+        **_plot_calibration_kwargs(session),
+    )
+
+    messages = []
+    if open_viewer:
+        try:
+            session = edit_hfo2_heavy_candidates_with_napari(
+                session,
+                heavy_channel=channels.heavy,
+                image_key="processed",
+            )
+            messages.append("HAADF heavy-column napari review finished.")
+        except Exception as exc:
+            messages.append(f"HAADF heavy-column napari review failed: {type(exc).__name__}: {exc}")
+
+    active_path = save_active_session(session, result_root)
+    messages.append(f"heavy_count: {len(filter_points_by_role(session.candidate_points, 'heavy_atom'))}")
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[hfo2_stage_summary(session, active_path)],
+        figures=[fig],
+        messages=messages,
+    )
+
+
+def run_hfo2_light_detection(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    light_detection: DetectionConfig,
+    light_options: dict[str, Any],
+    open_viewer: bool = False,
+) -> NotebookResult:
+    session, heavy_points = _require_heavy_anchors(session)
+    channels = workflow_channels(session)
+    config = HfO2MultichannelDetectionConfig(
+        heavy_channel=channels.heavy,
+        light_channel=channels.light,
+        confirm_channel=channels.confirm,
+        light_detection=light_detection,
+        **dict(light_options),
+    )
+
+    channels_to_clear = [channels.light]
+    if channels.confirm is not None:
+        channels_to_clear.append(channels.confirm)
+    _clear_preprocess_results(session, channels_to_clear)
+    session = detect_hfo2_light_candidates(session, config, heavy_points=heavy_points)
+
+    heavy_points = filter_points_by_role(session.candidate_points, "heavy_atom")
+    light_points = filter_points_by_role(session.candidate_points, "light_atom")
+    light_fig, _ = plot_atom_overlay(
+        session.get_processed_image(channels.light),
+        light_points,
+        title="iDPC light-column candidates",
+        origin_xy=session.get_processed_origin(channels.light),
+        point_size=14.0,
+        point_color="#00a5cf",
+        **_plot_calibration_kwargs(session),
+    )
+    heavy_fig, _ = plot_atom_overlay(
+        session.get_processed_image(channels.heavy),
+        heavy_points,
+        title="HAADF heavy-column reference",
+        origin_xy=session.get_processed_origin(channels.heavy),
+        point_size=14.0,
+        point_color="#ff8c00",
+        **_plot_calibration_kwargs(session),
+    )
+
+    messages = []
+    if open_viewer:
+        try:
+            session = edit_hfo2_light_candidates_with_napari(
+                session,
+                heavy_channel=channels.heavy,
+                light_channel=channels.light,
+                image_key="processed",
+            )
+            messages.append("iDPC light-column napari review finished.")
+        except Exception as exc:
+            messages.append(f"iDPC light-column napari review failed: {type(exc).__name__}: {exc}")
+
+    active_path = save_active_session(session, result_root)
+    messages.extend(
+        [
+            f"heavy_count: {len(filter_points_by_role(session.candidate_points, 'heavy_atom'))}",
+            f"light_count: {len(filter_points_by_role(session.candidate_points, 'light_atom'))}",
+        ]
+    )
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[hfo2_stage_summary(session, active_path)],
+        figures=[light_fig, heavy_fig],
+        messages=messages,
+    )
+
+
+def show_hfo2_detection_overview(
+    session: AnalysisSession,
+    *,
+    open_viewer: bool = False,
+    show_raw_layer: bool = False,
+) -> NotebookResult:
+    _require_hfo2_session(session)
+    channels = workflow_channels(session)
+    heavy_points = filter_points_by_role(session.candidate_points, "heavy_atom")
+    light_points = filter_points_by_role(session.candidate_points, "light_atom")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
+    plot_atom_overlay(
+        session.get_processed_image(channels.heavy),
+        heavy_points,
+        ax=axes[0],
+        title="HAADF heavy-column overview",
+        origin_xy=session.get_processed_origin(channels.heavy),
+        point_size=14.0,
+        point_color="#ff8c00",
+        **_plot_calibration_kwargs(session),
+    )
+    plot_atom_overlay(
+        session.get_processed_image(channels.light),
+        light_points,
+        ax=axes[1],
+        title="iDPC light-column overview",
+        origin_xy=session.get_processed_origin(channels.light),
+        point_size=14.0,
+        point_color="#00a5cf",
+        **_plot_calibration_kwargs(session),
+    )
+    plt.tight_layout()
+
+    messages = []
+    if open_viewer:
+        try:
+            viewer = launch_detection_napari_viewer(session, show_raw_layer=show_raw_layer)
+            viewer.show(block=True)
+            messages.append("Read-only detection overview closed.")
+        except Exception as exc:
+            messages.append(f"Read-only detection overview failed: {type(exc).__name__}: {exc}")
+    else:
+        messages.append("Set OPEN_DETECTION_OVERVIEW_VIEWER = True to open the read-only napari overview.")
+
+    return NotebookResult(session=session, figures=[fig], messages=messages)
+
+
+def run_hfo2_refine_curate(
+    session: AnalysisSession,
+    *,
+    result_root: str | Path,
+    refinement_config: RefinementConfig,
+    curation_config: CurationConfig,
+) -> NotebookResult:
+    _require_detection_ready(session)
+    channels = workflow_channels(session)
+
+    _clear_preprocess_results(session, session.list_channels())
+    session.clear_downstream_results("detect")
+    session = refine_points(session, refinement_config)
+    session = curate_points(session, curation_config)
+
+    display_points = (
+        session.curated_points.query("keep == True")
+        if "keep" in session.curated_points.columns
+        else session.curated_points
+    )
+    overlay_points = display_points if not display_points.empty else session.refined_points
+    heavy_overlay = filter_points_by_role(overlay_points, "heavy_atom")
+    light_overlay = filter_points_by_role(overlay_points, "light_atom")
+
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.6))
+    plot_atom_overlay(
+        session.get_processed_image(channels.heavy),
+        heavy_overlay,
+        ax=axes[0],
+        title="HAADF refined heavy columns",
+        origin_xy=session.get_processed_origin(channels.heavy),
+        point_size=14.0,
+        point_color="#ff8c00",
+        **_plot_calibration_kwargs(session),
+    )
+    plot_atom_overlay(
+        session.get_processed_image(channels.light),
+        light_overlay,
+        ax=axes[1],
+        title="iDPC refined light columns",
+        origin_xy=session.get_processed_origin(channels.light),
+        point_size=14.0,
+        point_color="#00a5cf",
+        **_plot_calibration_kwargs(session),
+    )
+    plot_histogram_or_distribution(
+        session.curated_points.get("quality_score", pd.Series(dtype=float)),
+        title="Refinement quality",
+        xlabel="quality_score",
+        ax=axes[2],
+    )
+    plt.tight_layout()
+
+    active_path = save_active_session(session, result_root)
+    return NotebookResult(
+        session=session,
+        active_path=active_path,
+        tables=[hfo2_stage_summary(session, active_path), session.curated_points.head()],
+        figures=[fig],
+        messages=[
+            f"refined_count: {len(session.refined_points)}",
+            f"auto_keep_count: {len(display_points)}",
+        ],
+    )
+
+
+def show_hfo2_refinement_viewer(
+    session: AnalysisSession,
+    *,
+    open_viewer: bool = False,
+    show_raw_layer: bool = False,
+    show_candidate_layer: bool = False,
+    point_size: float = 5.0,
+) -> NotebookResult:
+    _require_hfo2_session(session)
+    if session.refined_points.empty:
+        return NotebookResult(session=session, messages=["No refined_points yet; run the refinement stage first."])
+
+    if open_viewer:
+        try:
+            viewer = launch_refinement_napari_viewer(
+                session,
+                show_raw_layer=show_raw_layer,
+                show_candidate_layer=show_candidate_layer,
+                point_size=point_size,
+            )
+            viewer.show(block=True)
+            return NotebookResult(session=session, messages=["Read-only refinement viewer closed."])
+        except Exception as exc:
+            return NotebookResult(
+                session=session,
+                messages=[f"Read-only refinement viewer failed: {type(exc).__name__}: {exc}"],
+            )
+    return NotebookResult(
+        session=session,
+        messages=["Set OPEN_REFINEMENT_VIEWER = True to open the read-only refinement viewer."],
+    )
+
+
+def save_final_checkpoint_if_requested(
+    session: AnalysisSession | None,
+    *,
+    result_root: str | Path,
+    filename: str,
+    enabled: bool,
+) -> NotebookResult:
+    if session is None:
+        return NotebookResult(messages=["No session yet; run the main workflow stages first."])
+    if session.current_stage != "curated":
+        return NotebookResult(
+            session=session,
+            messages=[f"Current stage is {session.current_stage!r}; finish refinement/curation first."],
+        )
+    if enabled:
+        checkpoint_path = save_checkpoint(session, result_root, filename)
+        return NotebookResult(session=session, messages=[f"Final checkpoint saved: {checkpoint_path}"])
+    return NotebookResult(
+        session=session,
+        messages=["Final checkpoint not saved; notebook 03 can continue from the active session."],
+    )
+
+
+def _load_real_hfo2_session(
+    *,
+    idpc_path: str | Path | None,
+    haadf_path: str | Path | None,
+    abf_path: str | Path | None,
+    channel_dataset_indices: dict[str, int | None] | None,
+    bundle_manual_calibration: PixelCalibration | dict[str, Any] | float | None,
+    primary_channel: str,
+) -> AnalysisSession:
+    if not idpc_path or not haadf_path:
+        raise ValueError("Real HfO2 mode requires both IDPC_PATH and HAADF_PATH.")
+
+    path_map = {"idpc": Path(idpc_path), "haadf": Path(haadf_path)}
+    if abf_path:
+        path_map["abf"] = Path(abf_path)
+
+    missing = [str(path) for path in path_map.values() if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing multichannel input files:\n" + "\n".join(missing))
+
+    contrast_modes = {"idpc": "bright_peak", "haadf": "bright_peak"}
+    if "abf" in path_map:
+        contrast_modes["abf"] = "dark_dip"
+
+    return load_image_bundle(
+        path_map,
+        primary_channel=primary_channel,
+        manual_calibration=bundle_manual_calibration,
+        contrast_modes=contrast_modes,
+        dataset_indices=channel_dataset_indices,
+    )
+
+
+def _require_hfo2_session(session: AnalysisSession | None) -> AnalysisSession:
+    if session is None:
+        raise RuntimeError("No session yet; initialize the HfO2 multichannel session first.")
+    if session.workflow_mode != "hfo2_multichannel":
+        raise RuntimeError(f"Expected hfo2_multichannel, got {session.workflow_mode!r}.")
+    return session
+
+
+def _require_generic_classification_session(session: AnalysisSession | None) -> AnalysisSession:
+    if session is None:
+        raise RuntimeError("No session yet; initialize the atom-column classification session first.")
+    if session.workflow_mode != "atom_column_classification":
+        raise RuntimeError(f"Expected atom_column_classification, got {session.workflow_mode!r}.")
+    return session
+
+
+def _require_heavy_anchors(session: AnalysisSession) -> tuple[AnalysisSession, pd.DataFrame]:
+    _require_hfo2_session(session)
+    heavy_points = filter_points_by_role(session.candidate_points, "heavy_atom")
+    if heavy_points.empty:
+        raise RuntimeError("Heavy anchors are missing; run the HAADF heavy-column stage first.")
+    return session, heavy_points
+
+
+def _require_detection_ready(session: AnalysisSession) -> AnalysisSession:
+    _require_hfo2_session(session)
+    if session.current_stage == "heavy_reviewed":
+        raise RuntimeError("Only the heavy-column stage is complete; run the iDPC light-column stage next.")
+    if session.candidate_points.empty:
+        raise RuntimeError("candidate_points are missing; run heavy and light detection first.")
+    return session
+
+
+def _clear_preprocess_results(session: AnalysisSession, channel_names: list[str | None]) -> None:
+    for channel_name in channel_names:
+        if channel_name is None or channel_name not in session.list_channels():
+            continue
+        session.set_channel_state(channel_name, preprocess_result={})

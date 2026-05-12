@@ -1,0 +1,24 @@
+name: em-atom-workbench
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - jupyterlab
+  - notebook
+  - ipykernel
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-image
+  - scikit-learn
+  - hyperspy
+  - rosettasciio
+  - tifffile
+  - mrcfile
+  - h5py
+  - napari
+  - pyqt
+  - pyarrow
+  - pytest

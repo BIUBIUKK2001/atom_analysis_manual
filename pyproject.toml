@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "em-atom-workbench"
+version = "0.1.0"
+description = "Notebook-first workbench for atomic-resolution electron microscopy image analysis."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "Codex" }
+]
+keywords = [
+  "electron microscopy",
+  "STEM",
+  "atomic resolution",
+  "image analysis",
+  "napari",
+  "materials science"
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "pandas",
+  "matplotlib",
+  "scikit-image",
+  "scikit-learn",
+  "tifffile",
+  "mrcfile",
+  "h5py",
+  "pyarrow",
+]
+
+[project.optional-dependencies]
+interactive = [
+  "napari",
+  "pyqt5",
+  "ipywidgets",
+]
+dm = [
+  "hyperspy",
+  "rosettasciio",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
