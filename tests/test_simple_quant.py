@@ -6,168 +6,164 @@ import pytest
 
 from em_atom_workbench.session import AnalysisSession, PixelCalibration
 from em_atom_workbench.simple_quant import (
-    DirectionSpec,
-    DirectionalSpacingTask,
-    LineGroupingTask,
-    PairDistanceTask,
-    assign_lines_by_projection,
-    compute_directional_spacing,
-    compute_line_spacing,
-    compute_pair_distances,
-    prepare_quant_points,
-    resolve_direction_specs,
+    AnalysisROI,
+    BasisVectorSpec,
+    LineGuideTask,
+    NearestForwardTask,
+    PairSegmentTask,
+    PeriodicVectorTask,
+    compute_line_guides,
+    compute_nearest_forward_segments,
+    compute_pair_segments,
+    compute_periodic_vector_segments,
+    make_pair_center_points,
+    prepare_analysis_points,
+    resolve_basis_vector_specs,
 )
 
 
-def _grid_session(*, calibrated: bool = True) -> AnalysisSession:
-    xs, ys = np.meshgrid(np.arange(4) * 10.0, np.arange(3) * 12.0)
+def _analysis_points(xs: list[float], ys: list[float], class_ids: list[int] | None = None, roi_id: str = "global") -> pd.DataFrame:
+    class_ids = class_ids or [0] * len(xs)
     points = pd.DataFrame(
         {
-            "atom_id": np.arange(xs.size, dtype=int),
-            "x_px": xs.ravel(),
-            "y_px": ys.ravel(),
-            "class_id": np.tile([0, 1, 0, 1], 3),
-            "class_name": np.tile(["class_0", "class_1", "class_0", "class_1"], 3),
+            "point_id": [f"atom:{index}" for index in range(len(xs))],
+            "source_type": "atom",
+            "point_set": "atoms",
+            "atom_id": np.arange(len(xs), dtype=int),
+            "x_px": xs,
+            "y_px": ys,
+            "x_nm": np.asarray(xs, dtype=float) * 0.1,
+            "y_nm": np.asarray(ys, dtype=float) * 0.1,
+            "class_id": class_ids,
+            "class_name": [f"class_{value}" for value in class_ids],
+            "class_color": pd.NA,
+            "column_role": pd.NA,
             "keep": True,
+            "quality_score": np.nan,
+            "roi_id": roi_id,
+            "roi_name": roi_id,
+            "roi_color": "#ff9f1c",
+            "scope_id": f"{roi_id}:atoms:curated",
+            "source_table": "curated",
         }
     )
-    calibration = PixelCalibration(size=0.2, unit="nm", source="unit_test") if calibrated else PixelCalibration()
-    session = AnalysisSession(name="simple_quant_grid", pixel_calibration=calibration, raw_image=np.zeros((40, 40)))
+    return points
+
+
+def _grid_points(nx: int = 4, ny: int = 3, spacing_x: float = 10.0, spacing_y: float = 12.0) -> pd.DataFrame:
+    xs, ys = np.meshgrid(np.arange(nx) * spacing_x, np.arange(ny) * spacing_y)
+    class_ids = np.tile([0, 1, 0, 1][:nx], ny).tolist()
+    return _analysis_points(xs.ravel().tolist(), ys.ravel().tolist(), class_ids)
+
+
+def _grid_session() -> AnalysisSession:
+    points = _grid_points()[["atom_id", "x_px", "y_px", "class_id", "class_name", "keep"]].copy()
+    session = AnalysisSession(
+        name="simple_quant_v2_grid",
+        pixel_calibration=PixelCalibration(size=0.1, unit="nm", source="unit_test"),
+        raw_image=np.zeros((50, 50)),
+    )
     session.curated_points = points
     session.set_stage("curated")
     return session
 
 
-def _directions(points: pd.DataFrame) -> pd.DataFrame:
-    return resolve_direction_specs(
+def test_basis_vector_preserves_length() -> None:
+    points = _analysis_points([0.0, 3.0], [0.0, 4.0])
+
+    table = resolve_basis_vector_specs(points, [BasisVectorSpec(name="a", from_point_ids=("atom:0", "atom:1"))])
+
+    assert table.iloc[0]["vector_x_px"] == pytest.approx(3.0)
+    assert table.iloc[0]["vector_y_px"] == pytest.approx(4.0)
+    assert table.iloc[0]["length_px"] == pytest.approx(5.0)
+    assert table.iloc[0]["period_px"] == pytest.approx(5.0)
+
+
+def test_nearest_forward_segments_grid() -> None:
+    points = _grid_points()
+    basis = resolve_basis_vector_specs(points, [BasisVectorSpec(name="a", vector_px=(10.0, 0.0))])
+
+    segments = compute_nearest_forward_segments(
         points,
-        [
-            DirectionSpec(name="u", vector_px=(1.0, 0.0)),
-            DirectionSpec(name="v", vector_px=(0.0, 1.0)),
-        ],
+        basis,
+        NearestForwardTask(name="a_forward", basis="a", perpendicular_tolerance_px=1.0),
     )
 
+    assert len(segments) == 9
+    assert set(segments["task_type"]) == {"nearest_forward"}
+    assert np.allclose(segments["distance_px"], 10.0)
 
-def test_directional_spacing_u_on_regular_grid() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
-    direction_table = _directions(points)
 
-    table = compute_directional_spacing(
+def test_periodic_vector_segments_skip_nearest_neighbor() -> None:
+    points = _analysis_points([0.0, 5.0, 10.0, 20.0], [0.0, 2.0, 0.0, 0.0])
+    basis = resolve_basis_vector_specs(points, [BasisVectorSpec(name="a", vector_px=(10.0, 0.0))])
+
+    segments = compute_periodic_vector_segments(
         points,
-        direction_table,
-        [DirectionalSpacingTask(name="u_spacing", direction="u", perpendicular_tolerance_px=1.0)],
+        basis,
+        PeriodicVectorTask(name="periodic_a", basis="a", match_radius_fraction=0.25),
     )
 
-    assert len(table) == 9
-    assert np.allclose(table["distance_px"], 10.0)
+    assert list(segments["source_point_id"]) == ["atom:0", "atom:2"]
+    assert list(segments["target_point_id"]) == ["atom:2", "atom:3"]
+    assert np.allclose(segments["distance_px"], 10.0)
+    assert segments["period_residual_px"].max() < 1e-9
 
 
-def test_directional_spacing_v_on_regular_grid() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
-    direction_table = _directions(points)
+def test_multi_roi_segments() -> None:
+    session = _grid_session()
+    rois = [
+        AnalysisROI("left", polygon_xy_px=((-1.0, -1.0), (11.0, -1.0), (11.0, 30.0), (-1.0, 30.0))),
+        AnalysisROI("right", polygon_xy_px=((19.0, -1.0), (31.0, -1.0), (31.0, 30.0), (19.0, 30.0))),
+    ]
+    points = prepare_analysis_points(session, rois=rois)
+    basis = resolve_basis_vector_specs(points, [BasisVectorSpec(name="a", vector_px=(10.0, 0.0))])
 
-    table = compute_directional_spacing(
+    segments = compute_nearest_forward_segments(
         points,
-        direction_table,
-        [DirectionalSpacingTask(name="v_spacing", direction="v", perpendicular_tolerance_px=1.0)],
+        basis,
+        NearestForwardTask(name="roi_a_forward", basis="a", perpendicular_tolerance_px=1.0),
     )
 
-    assert len(table) == 8
-    assert np.allclose(table["distance_px"], 12.0)
+    assert set(segments["roi_id"]) == {"left", "right"}
+    assert set(segments["scope_id"]) == {"left:atoms:curated", "right:atoms:curated"}
+    assert segments.groupby("roi_id")["segment_id"].count().to_dict() == {"left": 3, "right": 3}
 
 
-def test_class_to_class_nearest_pair_distance() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
-
-    table = compute_pair_distances(
+def test_pair_center_points() -> None:
+    points = _analysis_points([0.0, 4.0], [0.0, 0.0], class_ids=[0, 1])
+    segments = compute_pair_segments(
         points,
-        [
-            PairDistanceTask(
-                name="class0_class1",
-                source_class_ids=(0,),
-                target_class_ids=(1,),
-                max_distance_px=11.0,
-                unique_pairs=True,
-            )
-        ],
+        None,
+        PairSegmentTask(name="pair01", source_class_ids=(0,), target_class_ids=(1,)),
     )
 
-    assert not table.empty
-    assert table["distance_px"].min() == pytest.approx(10.0)
-    assert set(table["source_class_id"]) == {0}
-    assert set(table["target_class_id"]) == {1}
+    centers = make_pair_center_points(segments, class_name="pair_center")
+
+    assert len(centers) == 1
+    assert centers.iloc[0]["point_set"] == "pair_centers"
+    assert centers.iloc[0]["x_px"] == pytest.approx(2.0)
+    assert centers.iloc[0]["y_px"] == pytest.approx(0.0)
+    assert centers.iloc[0]["parent_source_point_id"] == "atom:0"
+    assert centers.iloc[0]["parent_target_point_id"] == "atom:1"
 
 
-def test_explicit_atom_pairs_distance() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
+def test_line_guides_group_axis_t_and_s() -> None:
+    points = _grid_points()
+    basis = resolve_basis_vector_specs(points, [BasisVectorSpec(name="a", vector_px=(10.0, 0.0))])
 
-    table = compute_pair_distances(
+    rows = compute_line_guides(
         points,
-        [PairDistanceTask(name="explicit", explicit_atom_pairs=((0, 5),), unique_pairs=True)],
+        basis,
+        LineGuideTask(name="rows", basis="a", group_axis="t", line_tolerance_px=1.0, min_points_per_line=4),
     )
-
-    assert len(table) == 1
-    assert table.iloc[0]["source_atom_id"] == 0
-    assert table.iloc[0]["target_atom_id"] == 5
-    assert table.iloc[0]["distance_px"] == pytest.approx(np.hypot(10.0, 12.0))
-
-
-def test_group_axis_t_groups_rows() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
-    direction_table = _directions(points)
-
-    assignments = assign_lines_by_projection(
+    columns = compute_line_guides(
         points,
-        direction_table,
-        LineGroupingTask(name="rows", direction="u", group_axis="t", line_tolerance_px=1.0, min_atoms_per_line=4),
+        basis,
+        LineGuideTask(name="columns", basis="a", group_axis="s", line_tolerance_px=1.0, min_points_per_line=3),
     )
 
-    assert assignments["line_id"].nunique() == 3
-    assert assignments.groupby("line_id")["atom_id"].count().tolist() == [4, 4, 4]
-
-
-def test_group_axis_s_groups_columns() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
-    direction_table = _directions(points)
-
-    assignments = assign_lines_by_projection(
-        points,
-        direction_table,
-        LineGroupingTask(name="columns", direction="u", group_axis="s", line_tolerance_px=1.0, min_atoms_per_line=3),
-    )
-
-    assert assignments["line_id"].nunique() == 4
-    assert assignments.groupby("line_id")["atom_id"].count().tolist() == [3, 3, 3, 3]
-
-
-def test_calibrated_spacing_outputs_pm_and_uncalibrated_stays_nan() -> None:
-    calibrated_points = prepare_quant_points(_grid_session(calibrated=True), source_table="curated")
-    direction_table = _directions(calibrated_points)
-    table = compute_directional_spacing(
-        calibrated_points,
-        direction_table,
-        [DirectionalSpacingTask(name="u_spacing", direction="u", perpendicular_tolerance_px=1.0)],
-    )
-    assert table["distance_pm"].iloc[0] == pytest.approx(2000.0)
-
-    uncalibrated_points = prepare_quant_points(_grid_session(calibrated=False), source_table="curated")
-    table = compute_directional_spacing(
-        uncalibrated_points,
-        _directions(uncalibrated_points),
-        [DirectionalSpacingTask(name="u_spacing", direction="u", perpendicular_tolerance_px=1.0)],
-    )
-    assert table["distance_px"].notna().all()
-    assert table["distance_pm"].isna().all()
-
-
-def test_line_spacing_computes_width_and_next_spacing() -> None:
-    points = prepare_quant_points(_grid_session(), source_table="curated")
-    direction_table = _directions(points)
-    task = LineGroupingTask(name="rows", direction="u", group_axis="t", line_tolerance_px=1.0, min_atoms_per_line=4)
-
-    assignments = assign_lines_by_projection(points, direction_table, task)
-    spacing = compute_line_spacing(points, assignments, direction_table, task)
-
-    valid = spacing.loc[spacing["next_atom_id"].notna()]
-    assert np.allclose(valid["spacing_to_next_px"], 10.0)
-    assert valid["spacing_to_next_pm"].iloc[0] == pytest.approx(2000.0)
+    assert len(rows) == 3
+    assert len(columns) == 4
+    assert set(rows["group_axis"]) == {"t"}
+    assert set(columns["group_axis"]) == {"s"}

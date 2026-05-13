@@ -50,14 +50,25 @@ from .session import (
     RefinementConfig,
 )
 from .simple_quant import (
+    AnalysisROI,
+    BasisVectorSpec,
     DirectionalSpacingTask,
     LineGroupingTask,
+    LineGuideTask,
+    NearestForwardTask,
     PairDistanceTask,
+    PairSegmentTask,
+    PeriodicVectorTask,
     assign_lines_by_projection,
+    combine_analysis_points,
     compute_directional_spacing,
     compute_line_spacing,
     compute_pair_distances,
+    make_pair_center_points,
+    prepare_analysis_points,
     prepare_quant_points,
+    resolve_basis_vector_specs,
+    run_measurement_tasks,
     summarize_simple_quant_table,
 )
 from .utils import (
@@ -418,6 +429,140 @@ def export_simple_quant_analysis(
         "tables": table_paths,
     }
     session.set_stage("simple_quant")
+    checkpoint_path = session.save_pickle(dirs["session"] / "02_simple_quant_session.pkl")
+    manifest["manifest"] = str(manifest_path)
+    manifest["session_checkpoint"] = str(checkpoint_path)
+    return manifest
+
+
+def _roi_table_from_points(points: pd.DataFrame) -> pd.DataFrame:
+    if points is None or points.empty or "roi_id" not in points.columns:
+        return pd.DataFrame(columns=["roi_id", "roi_name", "roi_color", "point_count"])
+    columns = [column for column in ("roi_id", "roi_name", "roi_color") if column in points.columns]
+    table = points.groupby(columns, dropna=False).size().reset_index(name="point_count")
+    return table
+
+
+def initialize_simple_quant_v2_analysis(
+    *,
+    session_path: str | Path | None,
+    result_root: str | Path,
+    source_table: str,
+    use_keep_only: bool,
+    class_filter: tuple[str, ...] | list[str] | set[str] | None,
+    class_id_filter: tuple[int, ...] | list[int] | set[int] | None,
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | None,
+    image_channel: str | None,
+    image_key: str,
+) -> dict[str, Any]:
+    session = load_or_connect_session(result_root, session_path=session_path)
+    analysis_points = prepare_analysis_points(
+        session,
+        source_table=source_table,
+        use_keep_only=use_keep_only,
+        class_filter=class_filter,
+        class_id_filter=class_id_filter,
+        rois=rois,
+    )
+    image, resolved_channel, resolved_image_key = _resolve_simple_quant_image(
+        session,
+        image_channel=image_channel,
+        image_key=image_key,
+    )
+    output_dirs = _simple_quant_output_dirs(result_root)
+    roi_table = _roi_table_from_points(analysis_points)
+    summary = pd.DataFrame(
+        [
+            {"field": "session_name", "value": session.name},
+            {"field": "current_stage", "value": session.current_stage},
+            {"field": "primary_channel", "value": session.primary_channel},
+            {"field": "source_table", "value": source_table},
+            {"field": "analysis_point_rows", "value": len(analysis_points)},
+            {"field": "unique_points", "value": analysis_points["point_id"].nunique() if "point_id" in analysis_points else len(analysis_points)},
+            {"field": "roi_count", "value": roi_table["roi_id"].nunique() if "roi_id" in roi_table else 0},
+            {"field": "output_dir", "value": str(output_dirs["output"])},
+        ]
+    )
+    return {
+        "session": session,
+        "analysis_points": analysis_points,
+        "roi_table": roi_table,
+        "image": image,
+        "image_channel": resolved_channel,
+        "image_key": resolved_image_key,
+        "output_dirs": output_dirs,
+        "summary_tables": {
+            "simple_quant_v2_summary": summary,
+            "roi_table": roi_table,
+            "analysis_points_preview": analysis_points.head(),
+        },
+    }
+
+
+def run_simple_quant_measurements(
+    analysis_points: pd.DataFrame,
+    basis_vector_table: pd.DataFrame,
+    tasks: tuple[Any, ...] | list[Any],
+) -> dict[str, pd.DataFrame]:
+    result = run_measurement_tasks(analysis_points, basis_vector_table, tasks)
+    measurement_segments = result["measurement_segments"]
+    value_column = "distance_pm" if not measurement_segments.empty and measurement_segments["distance_pm"].notna().any() else "distance_px"
+    result["summaries"] = summarize_simple_quant_table(
+        measurement_segments,
+        ["task_name", "task_type", "roi_id"],
+        value_column,
+    )
+    return result
+
+
+def export_simple_quant_v2_analysis(
+    *,
+    session: AnalysisSession,
+    output_dirs: dict[str, Path] | None = None,
+    result_root: str | Path | None = None,
+    analysis_points: pd.DataFrame | None = None,
+    roi_table: pd.DataFrame | None = None,
+    basis_vector_table: pd.DataFrame | None = None,
+    measurement_segments: pd.DataFrame | None = None,
+    pair_center_points: pd.DataFrame | None = None,
+    line_guides: pd.DataFrame | None = None,
+    summaries: pd.DataFrame | None = None,
+    figures: dict[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    dirs = output_dirs or _simple_quant_output_dirs(result_root or "results")
+    tables = {
+        "analysis_points": analysis_points,
+        "roi_table": roi_table,
+        "basis_vector_table": basis_vector_table,
+        "measurement_segments": measurement_segments,
+        "pair_center_points": pair_center_points,
+        "line_guides": line_guides,
+        "summaries": summaries,
+    }
+    table_paths: dict[str, str] = {}
+    for name, table in tables.items():
+        if table is None:
+            continue
+        target = dirs["tables"] / f"{name}.csv"
+        table.to_csv(target, index=False)
+        table_paths[name] = str(target)
+    figure_paths = _save_simple_quant_figures(figures or {}, dirs["figures"])
+    config_path = write_json(dirs["configs"] / "simple_quant_v2_config.json", dict(config or {}))
+    manifest = {
+        "workflow": "simple_quant_v2",
+        "output_dir": str(dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "configs": {"simple_quant_v2_config": str(config_path)},
+    }
+    manifest_path = write_json(dirs["output"] / "manifest.json", manifest)
+    session.annotations["simple_quant_v2"] = {
+        "output_dir": str(dirs["output"]),
+        "tables": table_paths,
+        "config": str(config_path),
+    }
+    session.set_stage("simple_quant_v2")
     checkpoint_path = session.save_pickle(dirs["session"] / "02_simple_quant_session.pkl")
     manifest["manifest"] = str(manifest_path)
     manifest["session_checkpoint"] = str(checkpoint_path)

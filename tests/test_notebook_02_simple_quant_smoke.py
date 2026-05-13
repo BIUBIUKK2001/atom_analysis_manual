@@ -20,11 +20,14 @@ def test_build_02_simple_quant_notebook_generates_compilable_notebook() -> None:
 
     for parameter in (
         "SOURCE_TABLE",
-        "OPEN_DIRECTION_PICKER",
-        "DIRECTIONS",
-        "DIRECTIONAL_SPACING_TASKS",
-        "PAIR_DISTANCE_TASKS",
-        "LINE_GROUPING_TASKS",
+        "OPEN_ROI_PICKER",
+        "OPEN_BASIS_VECTOR_PICKER",
+        "BASIS_VECTOR_SPECS",
+        "MEASUREMENT_TASKS",
+        "PERIODIC_VECTOR_TASKS",
+        "SEGMENT_COLOR_BY",
+        "SEGMENT_LINEWIDTH",
+        "SHOW_SIDE_PANEL",
     ):
         assert parameter in joined
 
