@@ -7,9 +7,13 @@ one place.
 
 from __future__ import annotations
 
+import math
+import re
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -523,6 +527,7 @@ def export_simple_quant_v2_analysis(
     analysis_points: pd.DataFrame | None = None,
     roi_table: pd.DataFrame | None = None,
     basis_vector_table: pd.DataFrame | None = None,
+    roi_basis_table: pd.DataFrame | None = None,
     measurement_segments: pd.DataFrame | None = None,
     pair_center_points: pd.DataFrame | None = None,
     line_guides: pd.DataFrame | None = None,
@@ -535,6 +540,7 @@ def export_simple_quant_v2_analysis(
         "analysis_points": analysis_points,
         "roi_table": roi_table,
         "basis_vector_table": basis_vector_table,
+        "roi_basis_table": roi_basis_table,
         "measurement_segments": measurement_segments,
         "pair_center_points": pair_center_points,
         "line_guides": line_guides,
@@ -1378,6 +1384,355 @@ def save_final_checkpoint_if_requested(
     )
 
 
+def _ordered_final_atom_columns(table: pd.DataFrame) -> list[str]:
+    preferred = [
+        "atom_id",
+        "candidate_id",
+        "x_px",
+        "y_px",
+        "x_nm",
+        "y_nm",
+        "class_id",
+        "class_name",
+        "class_color",
+        "class_confidence",
+        "class_source",
+        "class_reviewed",
+        "keep",
+        "quality_score",
+        "fit_residual",
+        "fit_success",
+        "fit_method",
+        "fit_amplitude",
+        "fit_background",
+        "fit_sigma_x",
+        "fit_sigma_y",
+        "center_intensity",
+        "local_background",
+        "prominence",
+        "local_snr",
+        "integrated_intensity",
+        "column_role",
+        "seed_channel",
+        "detected_from_channels",
+        "flag_duplicate",
+        "flag_edge",
+        "flag_low_quality",
+        "flag_poor_fit",
+        "flag_spacing_violation",
+    ]
+    return [column for column in preferred if column in table.columns] + [
+        column for column in table.columns if column not in preferred
+    ]
+
+
+def _final_atom_table_with_physical_units(session: AnalysisSession) -> pd.DataFrame:
+    table = session.curated_points.copy()
+    calibration = session.pixel_calibration
+    pixel_size = getattr(calibration, "size", None)
+    unit = str(getattr(calibration, "unit", "px") or "px").strip().lower()
+    unit_to_nm = {
+        "nm": 1.0,
+        "nanometer": 1.0,
+        "nanometers": 1.0,
+        "a": 0.1,
+        "å": 0.1,
+        "angstrom": 0.1,
+        "angstroms": 0.1,
+        "pm": 0.001,
+        "picometer": 0.001,
+        "picometers": 0.001,
+    }
+    if pixel_size is not None and unit in unit_to_nm and "x_px" in table.columns and "y_px" in table.columns:
+        scale_nm = float(pixel_size) * unit_to_nm[unit]
+        if "x_nm" not in table.columns:
+            table["x_nm"] = pd.to_numeric(table["x_px"], errors="coerce") * scale_nm
+        if "y_nm" not in table.columns:
+            table["y_nm"] = pd.to_numeric(table["y_px"], errors="coerce") * scale_nm
+    return table[_ordered_final_atom_columns(table)]
+
+
+def _final_atom_class_summary(table: pd.DataFrame) -> pd.DataFrame:
+    if table.empty:
+        return pd.DataFrame()
+    group_columns = [column for column in ("class_id", "class_name", "class_color") if column in table.columns]
+    if not group_columns:
+        kept_rows = int(table["keep"].fillna(False).astype(bool).sum()) if "keep" in table.columns else len(table)
+        return pd.DataFrame({"total_rows": [len(table)], "kept_rows": [kept_rows]})
+    work = table.copy()
+    if "keep" not in work.columns:
+        work["keep"] = True
+    agg_spec: dict[str, tuple[str, str]] = {
+        "total_rows": ("atom_id" if "atom_id" in work.columns else group_columns[0], "count"),
+        "kept_rows": ("keep", "sum"),
+    }
+    if "quality_score" in work.columns:
+        agg_spec["mean_quality_score"] = ("quality_score", "mean")
+        agg_spec["median_quality_score"] = ("quality_score", "median")
+    if "fit_residual" in work.columns:
+        agg_spec["mean_fit_residual"] = ("fit_residual", "mean")
+        agg_spec["median_fit_residual"] = ("fit_residual", "median")
+    return work.groupby(group_columns, dropna=False).agg(**agg_spec).reset_index()
+
+
+def _final_atom_flag_summary(table: pd.DataFrame) -> pd.DataFrame:
+    flag_columns = [column for column in table.columns if column.startswith("flag_")]
+    rows = []
+    for column in flag_columns:
+        values = table[column].fillna(False).astype(bool)
+        rows.append({"flag": column, "true_count": int(values.sum()), "false_count": int((~values).sum())})
+    return pd.DataFrame(rows)
+
+
+def _xlsx_column_name(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def _xlsx_cell_ref(row_index: int, column_index: int) -> str:
+    return f"{_xlsx_column_name(column_index)}{row_index}"
+
+
+def _xlsx_safe_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+
+
+def _xlsx_safe_sheet_name(name: str, used: set[str]) -> str:
+    safe = re.sub(r"[\[\]:*?/\\]", "_", str(name)).strip() or "Sheet"
+    safe = safe[:31]
+    candidate = safe
+    counter = 2
+    while candidate in used:
+        suffix = f"_{counter}"
+        candidate = f"{safe[:31 - len(suffix)]}{suffix}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def _xlsx_cell_xml(value: Any, row_index: int, column_index: int) -> str:
+    cell_ref = _xlsx_cell_ref(row_index, column_index)
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return f'<c r="{cell_ref}"/>'
+    if pd.isna(value) if not isinstance(value, (list, tuple, dict, set, np.ndarray)) else False:
+        return f'<c r="{cell_ref}"/>'
+    if isinstance(value, (bool, np.bool_)):
+        return f'<c r="{cell_ref}" t="b"><v>{1 if bool(value) else 0}</v></c>'
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        numeric = float(value)
+        if math.isfinite(numeric):
+            return f'<c r="{cell_ref}"><v>{numeric:.15g}</v></c>'
+    text = escape(_xlsx_safe_text(value))
+    return f'<c r="{cell_ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+def _write_minimal_xlsx(output_path: Path, sheets: dict[str, pd.DataFrame]) -> None:
+    """Write a dependency-free .xlsx workbook for notebook exports.
+
+    This fallback intentionally keeps formatting simple. It exists so the final
+    atom export works in existing notebook kernels that do not have openpyxl.
+    """
+    used_names: set[str] = set()
+    safe_sheets = [(_xlsx_safe_sheet_name(name, used_names), table.copy()) for name, table in sheets.items()]
+
+    content_types = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+        '<Default Extension="xml" ContentType="application/xml"/>',
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>',
+        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>',
+    ]
+    for index, _ in enumerate(safe_sheets, start=1):
+        content_types.append(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+    content_types.append("</Types>")
+
+    workbook_sheets = [
+        f'<sheet name="{escape(sheet_name)}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, (sheet_name, _) in enumerate(safe_sheets, start=1)
+    ]
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets>{"".join(workbook_sheets)}</sheets>'
+        "</workbook>"
+    )
+    workbook_rels = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    ]
+    for index, _ in enumerate(safe_sheets, start=1):
+        workbook_rels.append(
+            f'<Relationship Id="rId{index}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{index}.xml"/>'
+        )
+    workbook_rels.append(
+        f'<Relationship Id="rId{len(safe_sheets) + 1}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+    )
+    workbook_rels.append("</Relationships>")
+
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        '<borders count="1"><border/></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
+        '</styleSheet>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+        '</Relationships>'
+    )
+    app_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        '<Application>em_atom_workbench</Application>'
+        '</Properties>'
+    )
+    core_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:dcterms="http://purl.org/dc/terms/" '
+        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        '<dc:creator>em_atom_workbench</dc:creator>'
+        '<dc:title>Final atom table export</dc:title>'
+        '</cp:coreProperties>'
+    )
+
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "\n".join(content_types))
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("docProps/app.xml", app_xml)
+        archive.writestr("docProps/core.xml", core_xml)
+        archive.writestr("xl/workbook.xml", workbook_xml)
+        archive.writestr("xl/_rels/workbook.xml.rels", "\n".join(workbook_rels))
+        archive.writestr("xl/styles.xml", styles_xml)
+        for sheet_index, (_, table) in enumerate(safe_sheets, start=1):
+            columns = [str(column) for column in table.columns]
+            row_xml = [
+                '<row r="1">'
+                + "".join(_xlsx_cell_xml(column, 1, column_index) for column_index, column in enumerate(columns, start=1))
+                + "</row>"
+            ]
+            for row_index, row in enumerate(table.itertuples(index=False, name=None), start=2):
+                row_xml.append(
+                    f'<row r="{row_index}">'
+                    + "".join(_xlsx_cell_xml(value, row_index, column_index) for column_index, value in enumerate(row, start=1))
+                    + "</row>"
+                )
+            max_row = max(len(table) + 1, 1)
+            max_col = max(len(columns), 1)
+            dimension = f"A1:{_xlsx_cell_ref(max_row, max_col)}"
+            worksheet_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                f'<dimension ref="{dimension}"/>'
+                '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+                'activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+                f'<sheetData>{"".join(row_xml)}</sheetData>'
+                f'<autoFilter ref="{dimension}"/>'
+                '</worksheet>'
+            )
+            archive.writestr(f"xl/worksheets/sheet{sheet_index}.xml", worksheet_xml)
+
+
+def _write_excel_workbook(output_path: Path, sheets: dict[str, pd.DataFrame]) -> str:
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        _write_minimal_xlsx(output_path, sheets)
+        return "minimal_xlsx"
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for sheet_name, table in sheets.items():
+            table.to_excel(writer, sheet_name=sheet_name, index=False)
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for column_cells in worksheet.columns:
+                max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 10), 32)
+    return "openpyxl"
+
+
+def export_final_atom_table_excel(
+    session: AnalysisSession | None,
+    *,
+    result_root: str | Path,
+    filename: str = "01_final_atom_columns.xlsx",
+    kept_only_sheet: bool = True,
+) -> NotebookResult:
+    if session is None:
+        raise RuntimeError("No session is loaded. Load the active session first or run the previous 01 notebook stages.")
+    if session.curated_points is None or session.curated_points.empty:
+        raise RuntimeError("curated_points is empty. Run the final curation stage before exporting Excel.")
+
+    output_dir = Path(result_root) / "01_findatom" / "tables"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / filename
+
+    all_points = _final_atom_table_with_physical_units(session)
+    if "keep" in all_points.columns:
+        kept_points = all_points.loc[all_points["keep"] == True].copy()  # noqa: E712
+    else:
+        kept_points = all_points.copy()
+    class_summary = _final_atom_class_summary(all_points)
+    flag_summary = _final_atom_flag_summary(all_points)
+    calibration = session.pixel_calibration
+    metadata = pd.DataFrame(
+        [
+            {"field": "session_name", "value": session.name},
+            {"field": "current_stage", "value": session.current_stage},
+            {"field": "primary_channel", "value": session.primary_channel},
+            {"field": "curated_rows", "value": len(all_points)},
+            {"field": "kept_rows", "value": len(kept_points)},
+            {"field": "pixel_size", "value": getattr(calibration, "size", None)},
+            {"field": "pixel_unit", "value": getattr(calibration, "unit", None)},
+            {"field": "calibration_source", "value": getattr(calibration, "source", None)},
+        ]
+    )
+
+    sheets = {"all_curated_points": all_points}
+    if kept_only_sheet:
+        sheets["kept_points"] = kept_points
+    sheets.update(
+        {
+            "class_summary": class_summary,
+            "flag_summary": flag_summary,
+            "metadata": metadata,
+        }
+    )
+    writer_engine = _write_excel_workbook(output_path, sheets)
+
+    return NotebookResult(
+        session=session,
+        tables=[metadata, class_summary, flag_summary],
+        messages=[f"Final atom Excel exported: {output_path}", f"Excel writer: {writer_engine}"],
+    )
+
+
 def _load_real_hfo2_session(
     *,
     idpc_path: str | Path | None,
@@ -1442,6 +1797,197 @@ def _require_detection_ready(session: AnalysisSession) -> AnalysisSession:
     if session.candidate_points.empty:
         raise RuntimeError("candidate_points are missing; run heavy and light detection first.")
     return session
+
+
+def _safe_export_sheet(table: pd.DataFrame | None, sheet_name: str) -> pd.DataFrame:
+    if table is None:
+        return pd.DataFrame({"warning": [f"{sheet_name} table is not available"]})
+    if isinstance(table, pd.DataFrame) and table.empty and len(table.columns) == 0:
+        return pd.DataFrame({"warning": [f"{sheet_name} table is empty"]})
+    return table.copy()
+
+
+def _export_task_excel(output_path: str | Path, sheets: dict[str, pd.DataFrame | None]) -> dict[str, Any]:
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    safe_sheets = {name: _safe_export_sheet(table, name) for name, table in sheets.items()}
+    writer_engine = _write_excel_workbook(target, safe_sheets)
+    warnings = [
+        {"sheet": name, "warning": str(table.iloc[0]["warning"])}
+        for name, table in safe_sheets.items()
+        if list(table.columns) == ["warning"]
+    ]
+    return {"path": str(target), "writer_engine": writer_engine, "warnings": warnings}
+
+
+def export_task1A_excel(
+    output_dirs: dict[str, Path],
+    *,
+    period_segment_table: pd.DataFrame,
+    period_summary_table: pd.DataFrame,
+    task1A_config: pd.DataFrame,
+    roi_class_selection: pd.DataFrame,
+    basis_vectors: pd.DataFrame,
+    filename: str = "task1A_period_statistics.xlsx",
+) -> dict[str, Any]:
+    return _export_task_excel(
+        output_dirs["tables"] / filename,
+        {
+            "period_segments": period_segment_table,
+            "period_summary": period_summary_table,
+            "task1A_config": task1A_config,
+            "roi_class_selection": roi_class_selection,
+            "basis_vectors": basis_vectors,
+        },
+    )
+
+
+def export_task1B_excel(
+    output_dirs: dict[str, Path],
+    *,
+    cell_table: pd.DataFrame,
+    strain_reference_table: pd.DataFrame,
+    task1B_config: pd.DataFrame,
+    anchor_selection: pd.DataFrame,
+    qc_summary: pd.DataFrame,
+    filename: str = "task1B_polygon_strain_mapping.xlsx",
+) -> dict[str, Any]:
+    valid_cell_table = cell_table.loc[cell_table.get("valid", False).astype(bool)].copy() if cell_table is not None and not cell_table.empty else pd.DataFrame()
+    invalid_cell_table = cell_table.loc[~cell_table.get("valid", False).astype(bool)].copy() if cell_table is not None and not cell_table.empty else pd.DataFrame()
+    return _export_task_excel(
+        output_dirs["tables"] / filename,
+        {
+            "cell_table": cell_table,
+            "valid_cells": valid_cell_table,
+            "invalid_cells": invalid_cell_table,
+            "strain_reference": strain_reference_table,
+            "task1B_config": task1B_config,
+            "anchor_selection": anchor_selection,
+            "qc_summary": qc_summary,
+        },
+    )
+
+
+def export_task2_excel(
+    output_dirs: dict[str, Path],
+    *,
+    pair_table: pd.DataFrame,
+    pair_line_summary_table: pd.DataFrame,
+    task2_config: pd.DataFrame,
+    projection_axis_table: pd.DataFrame,
+    line_grouping_summary: pd.DataFrame,
+    filename: str = "task2_pair_line_statistics.xlsx",
+) -> dict[str, Any]:
+    valid_pair_table = pair_table.loc[pair_table.get("valid", False).astype(bool)].copy() if pair_table is not None and not pair_table.empty else pd.DataFrame()
+    invalid_pair_table = pair_table.loc[~pair_table.get("valid", False).astype(bool)].copy() if pair_table is not None and not pair_table.empty else pd.DataFrame()
+    return _export_task_excel(
+        output_dirs["tables"] / filename,
+        {
+            "pair_table": pair_table,
+            "valid_pairs": valid_pair_table,
+            "invalid_pairs": invalid_pair_table,
+            "line_summary": pair_line_summary_table,
+            "task2_config": task2_config,
+            "projection_axis": projection_axis_table,
+            "line_grouping": line_grouping_summary,
+        },
+    )
+
+
+def export_task3_excel(
+    output_dirs: dict[str, Path],
+    *,
+    group_centroid_table: pd.DataFrame,
+    group_displacement_table: pd.DataFrame,
+    task3_roi_table: pd.DataFrame,
+    task3_group_config: pd.DataFrame,
+    task3_summary: pd.DataFrame,
+    filename: str = "task3_group_center_displacement.xlsx",
+) -> dict[str, Any]:
+    return _export_task_excel(
+        output_dirs["tables"] / filename,
+        {
+            "group_centroids": group_centroid_table,
+            "group_displacements": group_displacement_table,
+            "task3_rois": task3_roi_table,
+            "task3_groups": task3_group_config,
+            "task3_summary": task3_summary,
+        },
+    )
+
+
+def save_notebook02_figures(
+    figures: dict[str, Any],
+    figures_dir: str | Path,
+    *,
+    formats: tuple[str, ...] = ("png", "pdf"),
+    dpi: int = 600,
+) -> dict[str, list[str]]:
+    target_dir = Path(figures_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    saved: dict[str, list[str]] = {}
+    for stem, figure in (figures or {}).items():
+        if figure is None:
+            continue
+        paths: list[str] = []
+        for fmt in formats:
+            target = target_dir / f"{stem}.{str(fmt).lstrip('.')}"
+            figure.savefig(target, bbox_inches="tight", dpi=int(dpi))
+            paths.append(str(target))
+        saved[str(stem)] = paths
+    return saved
+
+
+def export_notebook02_results(
+    *,
+    session: AnalysisSession,
+    output_dirs: dict[str, Path],
+    tables: dict[str, pd.DataFrame | None],
+    figures: dict[str, Any] | None = None,
+    configs: dict[str, Any] | None = None,
+    excel_exports: dict[str, Any] | None = None,
+    figure_formats: tuple[str, ...] = ("png", "pdf"),
+    figure_dpi: int = 600,
+) -> dict[str, Any]:
+    table_paths: dict[str, str] = {}
+    for name, table in (tables or {}).items():
+        if table is None:
+            continue
+        target = output_dirs["tables"] / f"{name}.csv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(target, index=False)
+        table_paths[str(name)] = str(target)
+    figure_paths = save_notebook02_figures(
+        figures or {},
+        output_dirs["figures"],
+        formats=tuple(figure_formats),
+        dpi=int(figure_dpi),
+    )
+    config_paths: dict[str, str] = {}
+    for name, payload in (configs or {}).items():
+        path = write_json(output_dirs["configs"] / f"{name}.json", payload if isinstance(payload, dict) else {"value": payload})
+        config_paths[str(name)] = str(path)
+    manifest = {
+        "workflow": "simple_quant_v2_task_notebook02",
+        "output_dir": str(output_dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "configs": config_paths,
+        "excel_exports": excel_exports or {},
+    }
+    manifest_path = write_json(output_dirs["output"] / "manifest.json", manifest)
+    session.annotations["notebook02_task_quant"] = {
+        "output_dir": str(output_dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "configs": config_paths,
+        "excel_exports": excel_exports or {},
+    }
+    session.set_stage("simple_quant_v2")
+    checkpoint_path = session.save_pickle(output_dirs["session"] / "02_simple_quant_session.pkl")
+    manifest["manifest"] = str(manifest_path)
+    manifest["session_checkpoint"] = str(checkpoint_path)
+    return manifest
 
 
 def _clear_preprocess_results(session: AnalysisSession, channel_names: list[str | None]) -> None:

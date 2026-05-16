@@ -83,6 +83,8 @@ class BasisVectorSpec:
     snap_to_nearest_points: bool = True
     use_length_as_period: bool = True
     period_px: float | None = None
+    roi_id: str | None = None
+    basis_role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -507,6 +509,18 @@ def _basis_row(basis_vector_table: pd.DataFrame, basis_name: str) -> pd.Series:
     return matches.iloc[0]
 
 
+def _infer_basis_role(name: str, roi_id: str | None = None) -> str | None:
+    value = str(name)
+    if roi_id is not None:
+        prefix = f"{roi_id}_"
+        if value.startswith(prefix) and len(value) > len(prefix):
+            return value[len(prefix) :]
+    parts = value.split("_")
+    if len(parts) >= 2 and parts[-1]:
+        return parts[-1]
+    return value if value in {"a", "b", "c", "u", "v"} else None
+
+
 def resolve_basis_vector_specs(
     points: pd.DataFrame,
     basis_specs: list[BasisVectorSpec] | tuple[BasisVectorSpec, ...],
@@ -577,6 +591,9 @@ def resolve_basis_vector_specs(
         rows.append(
             {
                 "basis_name": str(spec.name),
+                "roi_id": spec.roi_id,
+                "basis_role": spec.basis_role or _infer_basis_role(str(spec.name), spec.roi_id),
+                "is_global": spec.roi_id is None,
                 "vector_x_px": float(dx),
                 "vector_y_px": float(dy),
                 "length_px": float(length),
@@ -599,6 +616,178 @@ def resolve_basis_vector_specs(
             }
         )
     return pd.DataFrame(rows)
+
+
+def _roi_records(rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | pd.DataFrame | None) -> list[dict[str, Any]]:
+    if isinstance(rois, pd.DataFrame):
+        if rois.empty:
+            return [{"roi_id": "global", "roi_name": "global", "roi_color": "#ff9f1c", "enabled": True}]
+        records = []
+        for _, row in rois.drop_duplicates("roi_id").iterrows():
+            records.append(
+                {
+                    "roi_id": str(row.get("roi_id", "global")),
+                    "roi_name": str(row.get("roi_name", row.get("roi_id", "global"))),
+                    "roi_color": str(row.get("roi_color", "#ff9f1c")),
+                    "enabled": True,
+                }
+            )
+        return records
+    records = []
+    for roi in _default_rois(rois):
+        records.append(
+            {
+                "roi_id": str(roi.roi_id),
+                "roi_name": str(roi.roi_name or roi.roi_id),
+                "roi_color": str(roi.color),
+                "enabled": bool(roi.enabled),
+            }
+        )
+    return records
+
+
+def build_roi_basis_table(
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | pd.DataFrame | None,
+    basis_vector_table: pd.DataFrame,
+    *,
+    basis_roles: tuple[str, ...] = ("a", "b"),
+    global_fallback: bool = True,
+) -> pd.DataFrame:
+    basis_table = basis_vector_table.copy() if basis_vector_table is not None else pd.DataFrame()
+    records: list[dict[str, Any]] = []
+    for roi in _roi_records(rois):
+        if not roi.get("enabled", True):
+            continue
+        roi_id = str(roi["roi_id"])
+        for role in basis_roles:
+            role = str(role)
+            selected: pd.Series | None = None
+            if not basis_table.empty and {"roi_id", "basis_role"}.issubset(basis_table.columns):
+                specific = basis_table.loc[
+                    (basis_table["roi_id"].astype("object").astype(str) == roi_id)
+                    & (basis_table["basis_role"].astype("object").astype(str) == role)
+                ]
+                if not specific.empty:
+                    selected = specific.iloc[0]
+            if selected is None and global_fallback and not basis_table.empty:
+                global_rows = basis_table.loc[
+                    (basis_table.get("is_global", pd.Series(False, index=basis_table.index)).astype(bool))
+                    & (basis_table.get("basis_role", pd.Series(pd.NA, index=basis_table.index)).astype("object").astype(str) == role)
+                ]
+                if global_rows.empty:
+                    global_rows = basis_table.loc[basis_table["basis_name"].astype(str) == role]
+                if not global_rows.empty:
+                    selected = global_rows.iloc[0]
+            records.append(
+                {
+                    "roi_id": roi_id,
+                    "roi_name": roi.get("roi_name", roi_id),
+                    "basis_role": role,
+                    "basis_name": pd.NA if selected is None else selected["basis_name"],
+                    "is_global": pd.NA if selected is None else bool(selected.get("is_global", False)),
+                    "found": selected is not None,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def make_basis_specs_for_rois(
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | pd.DataFrame | None,
+    basis_roles: tuple[str, ...] = ("a", "b"),
+) -> list[BasisVectorSpec]:
+    specs: list[BasisVectorSpec] = []
+    for roi in _roi_records(rois):
+        if not roi.get("enabled", True):
+            continue
+        roi_id = str(roi["roi_id"])
+        if roi_id == "global":
+            for role in basis_roles:
+                specs.append(BasisVectorSpec(name=str(role), roi_id=None, basis_role=str(role)))
+        else:
+            for role in basis_roles:
+                specs.append(BasisVectorSpec(name=f"{roi_id}_{role}", roi_id=roi_id, basis_role=str(role)))
+    return specs
+
+
+def expand_tasks_by_roi_basis(
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | pd.DataFrame | None,
+    roi_basis_table: pd.DataFrame,
+    *,
+    task_kind: str,
+    basis_role: str = "a",
+    template_name: str,
+    point_set: str = "atoms",
+    class_ids: tuple[int, ...] | None = None,
+    class_names: tuple[str, ...] | None = None,
+    nearest_forward_kwargs: dict[str, Any] | None = None,
+    periodic_kwargs: dict[str, Any] | None = None,
+    line_guide_kwargs: dict[str, Any] | None = None,
+) -> list[Any]:
+    del rois  # roi_basis_table is the source of truth after mapping.
+    if roi_basis_table is None or roi_basis_table.empty:
+        return []
+    task_kind = str(task_kind)
+    rows = roi_basis_table.loc[
+        (roi_basis_table["basis_role"].astype(str) == str(basis_role))
+        & (roi_basis_table["found"].astype(bool))
+    ]
+    tasks: list[Any] = []
+    for _, row in rows.iterrows():
+        roi_id = str(row["roi_id"])
+        basis_name = str(row["basis_name"])
+        name = f"{roi_id}_{template_name}_{basis_role}"
+        common = {"name": name, "basis": basis_name, "point_set": point_set, "roi_ids": (roi_id,)}
+        if task_kind == "nearest_forward":
+            kwargs = dict(nearest_forward_kwargs or {})
+            tasks.append(
+                NearestForwardTask(
+                    **common,
+                    source_class_ids=class_ids,
+                    target_class_ids=class_ids,
+                    source_class_names=class_names,
+                    target_class_names=class_names,
+                    **kwargs,
+                )
+            )
+        elif task_kind == "periodic_vector":
+            kwargs = dict(periodic_kwargs or {})
+            tasks.append(PeriodicVectorTask(**common, class_ids=class_ids, class_names=class_names, **kwargs))
+        elif task_kind == "line_guide":
+            kwargs = dict(line_guide_kwargs or {})
+            tasks.append(LineGuideTask(**common, class_ids=class_ids, class_names=class_names, **kwargs))
+        else:
+            raise ValueError("task_kind must be 'nearest_forward', 'periodic_vector', or 'line_guide'.")
+    return tasks
+
+
+def flip_basis_vectors(
+    basis_vector_table: pd.DataFrame,
+    basis_names: tuple[str, ...] | list[str] | set[str],
+) -> pd.DataFrame:
+    table = basis_vector_table.copy()
+    if table.empty or not basis_names:
+        return table
+    names = {str(value) for value in basis_names}
+    mask = table["basis_name"].astype(str).isin(names)
+    for index in table.index[mask]:
+        table.loc[index, "vector_x_px"] = -float(table.loc[index, "vector_x_px"])
+        table.loc[index, "vector_y_px"] = -float(table.loc[index, "vector_y_px"])
+        table.loc[index, "ux"] = -float(table.loc[index, "ux"])
+        table.loc[index, "uy"] = -float(table.loc[index, "uy"])
+        table.loc[index, "vx"] = -float(table.loc[index, "uy"])
+        table.loc[index, "vy"] = float(table.loc[index, "ux"])
+        table.loc[index, "angle_deg"] = float(np.degrees(np.arctan2(float(table.loc[index, "uy"]), float(table.loc[index, "ux"]))))
+        for left, right in (
+            ("from_x1_px", "from_x2_px"),
+            ("from_y1_px", "from_y2_px"),
+            ("from_point_id_1", "from_point_id_2"),
+            ("from_atom_id_1", "from_atom_id_2"),
+        ):
+            if left in table.columns and right in table.columns:
+                old_left = table.loc[index, left]
+                table.loc[index, left] = table.loc[index, right]
+                table.loc[index, right] = old_left
+    return table
 
 
 def resolve_direction_specs(quant_points: pd.DataFrame, directions: list[DirectionSpec] | tuple[DirectionSpec, ...]) -> pd.DataFrame:
@@ -1397,9 +1586,9 @@ def compute_periodic_vector_segments(
         class_ids=task.class_ids,
         class_names=task.class_names,
     )
-    vector = np.asarray([float(basis["vector_x_px"]), float(basis["vector_y_px"])], dtype=float)
-    basis_length = float(basis["length_px"])
-    match_radius = float(task.match_radius_px) if task.match_radius_px is not None else basis_length * float(task.match_radius_fraction)
+    period_px = float(basis.get("period_px", basis["length_px"]))
+    vector = np.asarray([float(basis["ux"]), float(basis["uy"])], dtype=float) * period_px
+    match_radius = float(task.match_radius_px) if task.match_radius_px is not None else period_px * float(task.match_radius_fraction)
     records: list[dict[str, Any]] = []
     chain_counter = 0
     for scope_id, group in _scope_groups(candidates):
@@ -1775,3 +1964,822 @@ def summarize_simple_quant_table(
         stats = data[value_column].agg(["count", "mean", "std", "median", "min", "max"])
         result = pd.DataFrame([stats.to_dict()])
     return result[summary_columns]
+
+
+def _as_tuple_or_none(values: Any) -> tuple[Any, ...] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        return (values,)
+    try:
+        return tuple(values)
+    except TypeError:
+        return (values,)
+
+
+def _clean_class_ids(values: Any) -> tuple[int, ...] | None:
+    values = _as_tuple_or_none(values)
+    if values is None:
+        return None
+    result = tuple(int(value) for value in values if pd.notna(value))
+    return result or None
+
+
+def _class_selection_label(class_ids: tuple[int, ...] | None, class_names: tuple[str, ...] | None = None) -> str:
+    if class_ids:
+        return "+".join(f"class_id:{int(value)}" for value in class_ids)
+    if class_names:
+        return "+".join(f"class_name:{value}" for value in class_names)
+    return "all_classes"
+
+
+def _class_group_records(
+    points: pd.DataFrame,
+    *,
+    roi_id: str,
+    selected_class_ids: tuple[int, ...] | None = None,
+    selected_class_names: tuple[str, ...] | None = None,
+    class_group_mode: str = "per_class",
+) -> list[dict[str, Any]]:
+    roi_points = _filter_points_v2(
+        points,
+        point_set="atoms",
+        roi_ids=(str(roi_id),),
+        class_ids=selected_class_ids,
+        class_names=selected_class_names,
+    )
+    if roi_points.empty:
+        return [
+            {
+                "class_ids": selected_class_ids,
+                "class_names": selected_class_names,
+                "class_selection": _class_selection_label(selected_class_ids, selected_class_names),
+                "n_points": 0,
+            }
+        ]
+    mode = str(class_group_mode).lower()
+    if mode not in {"per_class", "union"}:
+        raise ValueError("class_group_mode must be 'per_class' or 'union'.")
+    if mode == "union":
+        return [
+            {
+                "class_ids": selected_class_ids,
+                "class_names": selected_class_names,
+                "class_selection": _class_selection_label(selected_class_ids, selected_class_names),
+                "n_points": int(len(roi_points)),
+            }
+        ]
+
+    records: list[dict[str, Any]] = []
+    if selected_class_ids is not None or "class_id" in roi_points.columns:
+        class_ids = selected_class_ids
+        if class_ids is None:
+            class_ids = tuple(int(value) for value in sorted(roi_points["class_id"].dropna().unique()))
+        for class_id in class_ids:
+            count = int((roi_points["class_id"] == int(class_id)).sum()) if "class_id" in roi_points.columns else 0
+            records.append(
+                {
+                    "class_ids": (int(class_id),),
+                    "class_names": None,
+                    "class_selection": _class_selection_label((int(class_id),), None),
+                    "n_points": count,
+                }
+            )
+    elif selected_class_names is not None or "class_name" in roi_points.columns:
+        class_names = selected_class_names
+        if class_names is None:
+            class_names = tuple(str(value) for value in sorted(roi_points["class_name"].dropna().astype(str).unique()))
+        for class_name in class_names:
+            count = int((roi_points["class_name"].astype(str) == str(class_name)).sum())
+            records.append(
+                {
+                    "class_ids": None,
+                    "class_names": (str(class_name),),
+                    "class_selection": _class_selection_label(None, (str(class_name),)),
+                    "n_points": count,
+                }
+            )
+    return records or [
+        {
+            "class_ids": selected_class_ids,
+            "class_names": selected_class_names,
+            "class_selection": _class_selection_label(selected_class_ids, selected_class_names),
+            "n_points": int(len(roi_points)),
+        }
+    ]
+
+
+def select_points_by_roi_and_class(
+    points: pd.DataFrame,
+    *,
+    roi_ids: tuple[str, ...] | list[str] | set[str] | None = None,
+    class_ids: tuple[int, ...] | list[int] | set[int] | None = None,
+    class_names: tuple[str, ...] | list[str] | set[str] | None = None,
+    point_set: str | None = "atoms",
+) -> pd.DataFrame:
+    """Return a copy of points filtered by task-local ROI and class settings."""
+
+    return _filter_points_v2(
+        points,
+        point_set=point_set,
+        roi_ids=None if roi_ids is None else tuple(str(value) for value in roi_ids),
+        class_ids=None if class_ids is None else tuple(int(value) for value in class_ids),
+        class_names=None if class_names is None else tuple(str(value) for value in class_names),
+    )
+
+
+def angle_delta_deg(angle_deg: float | np.ndarray, target_angle_deg: float | np.ndarray) -> float | np.ndarray:
+    """Wrapped signed angular difference in degrees, returned in [-180, 180)."""
+
+    return (np.asarray(angle_deg, dtype=float) - np.asarray(target_angle_deg, dtype=float) + 180.0) % 360.0 - 180.0
+
+
+def _robust_std(values: pd.Series | np.ndarray) -> float:
+    data = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(dtype=float)
+    if data.size == 0:
+        return np.nan
+    median = float(np.median(data))
+    mad = float(np.median(np.abs(data - median)))
+    return 1.4826 * mad
+
+
+def _sem(values: pd.Series | np.ndarray) -> float:
+    data = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(dtype=float)
+    if data.size <= 1:
+        return np.nan
+    return float(np.std(data, ddof=1) / np.sqrt(data.size))
+
+
+def _period_segment_columns() -> list[str]:
+    return [
+        "roi_id",
+        "roi_name",
+        "direction",
+        "class_selection",
+        "p0_id",
+        "p1_id",
+        "p0_x",
+        "p0_y",
+        "p1_x",
+        "p1_y",
+        "length_px",
+        "length_nm",
+        "length_A",
+        "length_pm",
+        "segment_angle_deg",
+        "target_angle_deg",
+        "angle_delta_deg",
+        "valid",
+        "invalid_reason",
+        "basis_name",
+        "task_name",
+        "chain_id",
+        "period_index",
+        "period_residual_px",
+        "source_class_id",
+        "target_class_id",
+        "source_class_name",
+        "target_class_name",
+    ]
+
+
+def _normalize_period_segments(
+    segments: pd.DataFrame,
+    *,
+    direction: str,
+    class_selection: str,
+    target_angle_deg: float,
+) -> pd.DataFrame:
+    columns = _period_segment_columns()
+    if segments is None or segments.empty:
+        return pd.DataFrame(columns=columns)
+    table = pd.DataFrame(
+        {
+            "roi_id": segments.get("roi_id", pd.Series(pd.NA, index=segments.index)),
+            "roi_name": segments.get("roi_name", pd.Series(pd.NA, index=segments.index)),
+            "direction": str(direction),
+            "class_selection": str(class_selection),
+            "p0_id": segments.get("source_point_id", pd.Series(pd.NA, index=segments.index)),
+            "p1_id": segments.get("target_point_id", pd.Series(pd.NA, index=segments.index)),
+            "p0_x": pd.to_numeric(segments.get("source_x_px", np.nan), errors="coerce"),
+            "p0_y": pd.to_numeric(segments.get("source_y_px", np.nan), errors="coerce"),
+            "p1_x": pd.to_numeric(segments.get("target_x_px", np.nan), errors="coerce"),
+            "p1_y": pd.to_numeric(segments.get("target_y_px", np.nan), errors="coerce"),
+            "length_px": pd.to_numeric(segments.get("distance_px", np.nan), errors="coerce"),
+            "length_nm": pd.to_numeric(segments.get("distance_nm", np.nan), errors="coerce"),
+            "basis_name": segments.get("basis_name", pd.Series(pd.NA, index=segments.index)),
+            "task_name": segments.get("task_name", pd.Series(pd.NA, index=segments.index)),
+            "chain_id": segments.get("chain_id", pd.Series(pd.NA, index=segments.index)),
+            "period_index": segments.get("period_index", pd.Series(pd.NA, index=segments.index)),
+            "period_residual_px": pd.to_numeric(segments.get("period_residual_px", np.nan), errors="coerce"),
+            "source_class_id": segments.get("source_class_id", pd.Series(pd.NA, index=segments.index)),
+            "target_class_id": segments.get("target_class_id", pd.Series(pd.NA, index=segments.index)),
+            "source_class_name": segments.get("source_class_name", pd.Series(pd.NA, index=segments.index)),
+            "target_class_name": segments.get("target_class_name", pd.Series(pd.NA, index=segments.index)),
+        }
+    )
+    table["length_A"] = table["length_nm"] * 10.0
+    table["length_pm"] = table["length_nm"] * 1000.0
+    table["segment_angle_deg"] = np.degrees(np.arctan2(table["p1_y"] - table["p0_y"], table["p1_x"] - table["p0_x"]))
+    table["target_angle_deg"] = float(target_angle_deg)
+    table["angle_delta_deg"] = angle_delta_deg(table["segment_angle_deg"].to_numpy(dtype=float), float(target_angle_deg))
+    status = segments.get("status", pd.Series("ok", index=segments.index)).astype(str)
+    table["valid"] = status.eq("ok")
+    table["invalid_reason"] = np.where(table["valid"], "", status)
+    return table[columns]
+
+
+def summarize_period_segments(period_segment_table: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "roi_id",
+        "roi_name",
+        "direction",
+        "class_selection",
+        "n_segments",
+        "length_mean_px",
+        "length_median_px",
+        "length_std_px",
+        "length_robust_std_px",
+        "length_sem_px",
+        "length_min_px",
+        "length_max_px",
+        "length_mean_A",
+        "length_median_A",
+        "length_std_A",
+        "length_robust_std_A",
+        "length_sem_A",
+        "length_min_A",
+        "length_max_A",
+        "angle_delta_mean_deg",
+        "angle_delta_median_deg",
+        "angle_delta_std_deg",
+        "angle_delta_robust_std_deg",
+    ]
+    if period_segment_table is None or period_segment_table.empty:
+        return pd.DataFrame(columns=columns)
+    data = period_segment_table.copy()
+    data = data.loc[data.get("valid", True).astype(bool)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    for column in ("length_px", "length_A", "angle_delta_deg"):
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    rows: list[dict[str, Any]] = []
+    for keys, group in data.groupby(["roi_id", "roi_name", "direction", "class_selection"], dropna=False, sort=False):
+        length_px = group["length_px"].dropna()
+        length_A = group["length_A"].dropna()
+        angle = group["angle_delta_deg"].dropna()
+        rows.append(
+            {
+                "roi_id": keys[0],
+                "roi_name": keys[1],
+                "direction": keys[2],
+                "class_selection": keys[3],
+                "n_segments": int(len(group)),
+                "length_mean_px": float(length_px.mean()) if len(length_px) else np.nan,
+                "length_median_px": float(length_px.median()) if len(length_px) else np.nan,
+                "length_std_px": float(length_px.std(ddof=1)) if len(length_px) > 1 else np.nan,
+                "length_robust_std_px": _robust_std(length_px),
+                "length_sem_px": _sem(length_px),
+                "length_min_px": float(length_px.min()) if len(length_px) else np.nan,
+                "length_max_px": float(length_px.max()) if len(length_px) else np.nan,
+                "length_mean_A": float(length_A.mean()) if len(length_A) else np.nan,
+                "length_median_A": float(length_A.median()) if len(length_A) else np.nan,
+                "length_std_A": float(length_A.std(ddof=1)) if len(length_A) > 1 else np.nan,
+                "length_robust_std_A": _robust_std(length_A),
+                "length_sem_A": _sem(length_A),
+                "length_min_A": float(length_A.min()) if len(length_A) else np.nan,
+                "length_max_A": float(length_A.max()) if len(length_A) else np.nan,
+                "angle_delta_mean_deg": float(angle.mean()) if len(angle) else np.nan,
+                "angle_delta_median_deg": float(angle.median()) if len(angle) else np.nan,
+                "angle_delta_std_deg": float(angle.std(ddof=1)) if len(angle) > 1 else np.nan,
+                "angle_delta_robust_std_deg": _robust_std(angle),
+            }
+        )
+    return pd.DataFrame(rows)[columns]
+
+
+def run_period_statistics_ab(
+    analysis_points: pd.DataFrame,
+    basis_vector_table: pd.DataFrame,
+    roi_basis_table: pd.DataFrame,
+    *,
+    roi_class_selection: dict[str, Any] | None = None,
+    basis_roles: tuple[str, ...] = ("a", "b"),
+    class_group_mode: str = "per_class",
+    match_radius_fraction: float = 0.30,
+    match_radius_px: float | None = None,
+    one_to_one: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """Run ROI-resolved a/b periodic-vector statistics with per-task class groups."""
+
+    if roi_basis_table is None or roi_basis_table.empty:
+        raise ValueError("roi_basis_table is empty; choose or define Task 1 basis vectors first.")
+    selection = dict(roi_class_selection or {})
+    segment_tables: list[pd.DataFrame] = []
+    selection_rows: list[dict[str, Any]] = []
+    task_rows: list[dict[str, Any]] = []
+    for _, basis_map in roi_basis_table.iterrows():
+        if str(basis_map.get("basis_role")) not in {str(role) for role in basis_roles}:
+            continue
+        if not bool(basis_map.get("found", False)):
+            continue
+        roi_id = str(basis_map["roi_id"])
+        direction = str(basis_map["basis_role"])
+        basis_name = str(basis_map["basis_name"])
+        basis = _basis_row(basis_vector_table, basis_name)
+        roi_selection = selection.get(roi_id, selection.get("default", None))
+        if isinstance(roi_selection, dict):
+            selected_class_ids = _clean_class_ids(roi_selection.get("class_ids"))
+            selected_class_names = (
+                tuple(str(value) for value in _as_tuple_or_none(roi_selection.get("class_names")) or ())
+                or None
+            )
+        else:
+            selected_class_ids = _clean_class_ids(roi_selection)
+            selected_class_names = None
+        class_groups = _class_group_records(
+            analysis_points,
+            roi_id=roi_id,
+            selected_class_ids=selected_class_ids,
+            selected_class_names=selected_class_names,
+            class_group_mode=class_group_mode,
+        )
+        for class_group in class_groups:
+            class_ids = class_group["class_ids"]
+            class_names = class_group["class_names"]
+            class_selection = class_group["class_selection"]
+            task_name = f"task1A_{roi_id}_{direction}_{str(class_selection).replace(':', '_').replace('+', '_')}"
+            task = PeriodicVectorTask(
+                name=task_name,
+                basis=basis_name,
+                point_set="atoms",
+                roi_ids=(roi_id,),
+                class_ids=class_ids,
+                class_names=class_names,
+                match_radius_fraction=match_radius_fraction,
+                match_radius_px=match_radius_px,
+                one_to_one=one_to_one,
+            )
+            raw_segments = compute_periodic_vector_segments(analysis_points, basis_vector_table, task)
+            period_segments = _normalize_period_segments(
+                raw_segments,
+                direction=direction,
+                class_selection=class_selection,
+                target_angle_deg=float(basis["angle_deg"]),
+            )
+            segment_tables.append(period_segments)
+            selection_rows.append(
+                {
+                    "roi_id": roi_id,
+                    "roi_name": basis_map.get("roi_name", roi_id),
+                    "direction": direction,
+                    "class_selection": class_selection,
+                    "class_group_mode": class_group_mode,
+                    "class_ids": class_ids,
+                    "class_names": class_names,
+                    "n_points": int(class_group.get("n_points", 0)),
+                }
+            )
+            task_rows.append({"task_name": task_name, **task.__dict__})
+    period_segment_table = (
+        pd.concat(segment_tables, ignore_index=True)
+        if any(table is not None and not table.empty for table in segment_tables)
+        else pd.DataFrame(columns=_period_segment_columns())
+    )
+    period_summary_table = summarize_period_segments(period_segment_table)
+    return {
+        "period_segment_table": period_segment_table,
+        "period_summary_table": period_summary_table,
+        "roi_class_selection": pd.DataFrame(selection_rows),
+        "task1A_tasks": pd.DataFrame(task_rows),
+    }
+
+
+def fit_single_gaussian_to_histogram(values: pd.Series | np.ndarray) -> dict[str, float]:
+    data = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return {"n": 0, "mean": np.nan, "std": np.nan, "median": np.nan, "robust_std": np.nan}
+    std = float(np.std(data, ddof=1)) if data.size > 1 else 0.0
+    return {
+        "n": int(data.size),
+        "mean": float(np.mean(data)),
+        "std": std,
+        "median": float(np.median(data)),
+        "robust_std": _robust_std(data),
+    }
+
+
+def _pixel_to_nm_from_table(table: pd.DataFrame) -> float | None:
+    value = getattr(table, "attrs", {}).get("pixel_to_nm")
+    if value is not None and np.isfinite(float(value)) and float(value) > 0:
+        return float(value)
+    return _pixel_to_nm_from_points(table)
+
+
+def _distance_A_to_px(distance_A: float | None, pixel_to_nm: float | None) -> float | None:
+    if distance_A is None or pixel_to_nm is None:
+        return None
+    distance_A = float(distance_A)
+    if not np.isfinite(distance_A) or distance_A <= 0.0:
+        return None
+    return distance_A * 0.1 / float(pixel_to_nm)
+
+
+def find_strict_mutual_nearest_pairs(
+    analysis_points: pd.DataFrame,
+    *,
+    roi_class_selection: dict[str, Any] | None = None,
+    pair_mode: str = "within_class",
+    source_class_ids: tuple[int, ...] | list[int] | None = None,
+    target_class_ids: tuple[int, ...] | list[int] | None = None,
+    max_pair_distance_px: float | None = None,
+    max_pair_distance_A: float | None = None,
+) -> pd.DataFrame:
+    """Find strict mutual nearest-neighbor pairs for Task 2."""
+
+    mode = str(pair_mode).lower()
+    if mode not in {"within_class", "between_classes"}:
+        raise ValueError("pair_mode must be 'within_class' or 'between_classes'.")
+    pixel_to_nm = _pixel_to_nm_from_table(analysis_points)
+    max_from_A_px = _distance_A_to_px(max_pair_distance_A, pixel_to_nm)
+    thresholds = [value for value in (max_pair_distance_px, max_from_A_px) if value is not None]
+    max_distance_px = min(float(value) for value in thresholds) if thresholds else None
+    roi_ids = (
+        tuple(str(value) for value in analysis_points["roi_id"].dropna().astype(str).unique())
+        if "roi_id" in analysis_points.columns
+        else ("global",)
+    )
+    selection = dict(roi_class_selection or {})
+    rows: list[dict[str, Any]] = []
+    pair_counter = 0
+
+    def row_record(roi_id: str, pair_mode_value: str, p1: pd.Series, p2: pd.Series, valid: bool, reason: str) -> dict[str, Any]:
+        nonlocal pair_counter
+        dx = float(p2["x_px"] - p1["x_px"])
+        dy = float(p2["y_px"] - p1["y_px"])
+        distance_px = float(np.hypot(dx, dy))
+        distance_nm = _pixel_to_nm_from_row_pair(p1, p2)
+        record = {
+            "roi_id": roi_id,
+            "roi_name": p1.get("roi_name", roi_id),
+            "pair_id": f"{roi_id}:pair:{pair_counter}",
+            "pair_mode": pair_mode_value,
+            "p1_id": _point_id(p1),
+            "p2_id": _point_id(p2),
+            "p1_class": p1.get("class_id", pd.NA),
+            "p2_class": p2.get("class_id", pd.NA),
+            "p1_x": float(p1["x_px"]),
+            "p1_y": float(p1["y_px"]),
+            "p2_x": float(p2["x_px"]),
+            "p2_y": float(p2["y_px"]),
+            "center_x": float((p1["x_px"] + p2["x_px"]) / 2.0),
+            "center_y": float((p1["y_px"] + p2["y_px"]) / 2.0),
+            "vector_x_px": dx,
+            "vector_y_px": dy,
+            "distance_px": distance_px,
+            "distance_nm": distance_nm,
+            "distance_A": distance_nm * 10.0 if np.isfinite(distance_nm) else np.nan,
+            "pair_angle_deg": float(np.degrees(np.arctan2(dy, dx))),
+            "valid": bool(valid),
+            "invalid_reason": reason,
+        }
+        pair_counter += 1
+        return record
+
+    for roi_id in roi_ids:
+        roi_selection = selection.get(roi_id, selection.get("default", None))
+        selected_ids = _clean_class_ids(roi_selection if not isinstance(roi_selection, dict) else roi_selection.get("class_ids"))
+        roi_points = select_points_by_roi_and_class(
+            analysis_points,
+            roi_ids=(roi_id,),
+            class_ids=selected_ids,
+            point_set="atoms",
+        )
+        if mode == "within_class":
+            class_ids = selected_ids
+            if class_ids is None:
+                class_ids = tuple(int(value) for value in sorted(roi_points["class_id"].dropna().unique()))
+            for class_id in class_ids:
+                group = roi_points.loc[roi_points["class_id"] == int(class_id)].reset_index(drop=True)
+                if len(group) < 2:
+                    continue
+                coords = group[["x_px", "y_px"]].to_numpy(dtype=float)
+                distances, indices = cKDTree(coords).query(coords, k=2)
+                nearest = indices[:, 1].astype(int)
+                seen: set[tuple[str, str]] = set()
+                for source_index, target_index in enumerate(nearest):
+                    if int(nearest[target_index]) != int(source_index):
+                        continue
+                    p1 = group.iloc[source_index]
+                    p2 = group.iloc[target_index]
+                    key = tuple(sorted((_point_id(p1), _point_id(p2))))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    distance_px = float(distances[source_index, 1])
+                    valid = max_distance_px is None or distance_px <= max_distance_px
+                    rows.append(row_record(roi_id, mode, p1, p2, valid, "" if valid else "too_far"))
+        else:
+            source_ids = _clean_class_ids(source_class_ids)
+            target_ids = _clean_class_ids(target_class_ids)
+            if source_ids is None or target_ids is None:
+                raise ValueError("between_classes mode requires source_class_ids and target_class_ids.")
+            sources = select_points_by_roi_and_class(analysis_points, roi_ids=(roi_id,), class_ids=source_ids, point_set="atoms").reset_index(drop=True)
+            targets = select_points_by_roi_and_class(analysis_points, roi_ids=(roi_id,), class_ids=target_ids, point_set="atoms").reset_index(drop=True)
+            if sources.empty or targets.empty:
+                continue
+            target_tree = cKDTree(targets[["x_px", "y_px"]].to_numpy(dtype=float))
+            source_tree = cKDTree(sources[["x_px", "y_px"]].to_numpy(dtype=float))
+            source_to_target_dist, source_to_target = target_tree.query(sources[["x_px", "y_px"]].to_numpy(dtype=float), k=1)
+            _target_to_source_dist, target_to_source = source_tree.query(targets[["x_px", "y_px"]].to_numpy(dtype=float), k=1)
+            seen_between: set[tuple[str, str]] = set()
+            for source_index, target_index in enumerate(source_to_target.astype(int)):
+                if int(target_to_source[target_index]) != int(source_index):
+                    continue
+                p1 = sources.iloc[source_index]
+                p2 = targets.iloc[target_index]
+                key = (_point_id(p1), _point_id(p2))
+                if key in seen_between:
+                    continue
+                seen_between.add(key)
+                distance_px = float(source_to_target_dist[source_index])
+                valid = max_distance_px is None or distance_px <= max_distance_px
+                rows.append(row_record(roi_id, mode, p1, p2, valid, "" if valid else "too_far"))
+    return pd.DataFrame(rows)
+
+
+def suggest_line_tolerance_from_projection(
+    pair_table: pd.DataFrame,
+    projection_vector: tuple[float, float],
+) -> pd.DataFrame:
+    if pair_table is None or pair_table.empty:
+        return pd.DataFrame(columns=["roi_id", "n_centers", "spacing_median_px", "spacing_iqr_px", "suggested_line_tolerance_px"])
+    vector = np.asarray(projection_vector, dtype=float)
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("projection_vector must be a non-zero 2D vector.")
+    unit = vector / norm
+    data = pair_table.loc[pair_table.get("valid", True).astype(bool)].copy()
+    rows: list[dict[str, Any]] = []
+    for roi_id, group in data.groupby("roi_id", dropna=False, sort=False):
+        centers = group[["center_x", "center_y"]].to_numpy(dtype=float)
+        if len(centers) < 2:
+            rows.append({"roi_id": roi_id, "n_centers": int(len(centers)), "spacing_median_px": np.nan, "spacing_iqr_px": np.nan, "suggested_line_tolerance_px": np.nan})
+            continue
+        s = centers @ unit
+        gaps = np.diff(np.sort(s))
+        gaps = gaps[np.isfinite(gaps) & (gaps > 1e-9)]
+        if gaps.size == 0:
+            suggested = np.nan
+            median = np.nan
+            iqr = np.nan
+        else:
+            q1, q3 = np.percentile(gaps, [25, 75])
+            median = float(np.median(gaps))
+            iqr = float(q3 - q1)
+            suggested = float(max(q3, median + 0.5 * iqr))
+        rows.append(
+            {
+                "roi_id": roi_id,
+                "n_centers": int(len(centers)),
+                "spacing_median_px": median,
+                "spacing_iqr_px": iqr,
+                "suggested_line_tolerance_px": suggested,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def assign_pair_center_lines_by_projection(
+    pair_table: pd.DataFrame,
+    *,
+    projection_vector: tuple[float, float],
+    line_tolerance_px: float | None = None,
+    min_pairs_per_line: int = 2,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Assign valid pair centers to 1D lines along a projection axis."""
+
+    if pair_table is None or pair_table.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    vector = np.asarray(projection_vector, dtype=float)
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("projection_vector must be a non-zero 2D vector.")
+    unit = vector / norm
+    suggestion = suggest_line_tolerance_from_projection(pair_table, tuple(vector))
+    table = pair_table.copy()
+    table["projection_s_px"] = np.nan
+    table["line_id"] = pd.NA
+    table["line_valid"] = False
+    table["line_invalid_reason"] = ""
+    summary_rows: list[dict[str, Any]] = []
+    for roi_id, group in table.groupby("roi_id", dropna=False, sort=False):
+        valid_index = group.index[group.get("valid", True).astype(bool)]
+        valid = table.loc[valid_index].copy()
+        if valid.empty:
+            continue
+        centers = valid[["center_x", "center_y"]].to_numpy(dtype=float)
+        raw_s = centers @ unit
+        origin = float(np.nanmin(raw_s))
+        valid["projection_s_px"] = raw_s - origin
+        tolerance = line_tolerance_px
+        if tolerance is None:
+            matched = suggestion.loc[suggestion["roi_id"].astype(str) == str(roi_id)]
+            if not matched.empty and np.isfinite(float(matched.iloc[0]["suggested_line_tolerance_px"])):
+                tolerance = float(matched.iloc[0]["suggested_line_tolerance_px"])
+            else:
+                tolerance = 3.0
+        ordered = valid.sort_values("projection_s_px")
+        raw_groups: list[list[int]] = []
+        current: list[int] = []
+        previous: float | None = None
+        for index, row in ordered.iterrows():
+            coord = float(row["projection_s_px"])
+            if previous is None or coord - previous <= float(tolerance):
+                current.append(index)
+            else:
+                raw_groups.append(current)
+                current = [index]
+            previous = coord
+        if current:
+            raw_groups.append(current)
+        line_id = 1
+        for raw_group in raw_groups:
+            if len(raw_group) < int(min_pairs_per_line):
+                table.loc[raw_group, "line_invalid_reason"] = "line_too_short"
+                continue
+            line_s = valid.loc[raw_group, "projection_s_px"]
+            table.loc[raw_group, "line_id"] = int(line_id)
+            table.loc[raw_group, "line_valid"] = True
+            summary_rows.append(
+                {
+                    "roi_id": roi_id,
+                    "line_id": int(line_id),
+                    "n_pairs": int(len(raw_group)),
+                    "projection_s_median": float(line_s.median()),
+                    "line_tolerance_px": float(tolerance),
+                }
+            )
+            line_id += 1
+        table.loc[valid.index, "projection_s_px"] = valid["projection_s_px"]
+    return table, pd.DataFrame(summary_rows)
+
+
+def summarize_pair_lines_median_iqr(pair_line_table: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "roi_id",
+        "line_id",
+        "n_pairs",
+        "projection_s_median",
+        "distance_median_A",
+        "distance_q1_A",
+        "distance_q3_A",
+        "distance_iqr_A",
+        "distance_median_px",
+        "distance_q1_px",
+        "distance_q3_px",
+        "distance_iqr_px",
+    ]
+    if pair_line_table is None or pair_line_table.empty:
+        return pd.DataFrame(columns=columns)
+    data = pair_line_table.loc[pair_line_table.get("valid", True).astype(bool) & pair_line_table.get("line_valid", False).astype(bool)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, Any]] = []
+    for (roi_id, line_id), group in data.groupby(["roi_id", "line_id"], dropna=False, sort=True):
+        dist_A = pd.to_numeric(group.get("distance_A", np.nan), errors="coerce").dropna()
+        dist_px = pd.to_numeric(group.get("distance_px", np.nan), errors="coerce").dropna()
+        q1_A, q3_A = (np.nan, np.nan) if dist_A.empty else np.percentile(dist_A, [25, 75])
+        q1_px, q3_px = (np.nan, np.nan) if dist_px.empty else np.percentile(dist_px, [25, 75])
+        rows.append(
+            {
+                "roi_id": roi_id,
+                "line_id": int(line_id),
+                "n_pairs": int(len(group)),
+                "projection_s_median": float(pd.to_numeric(group["projection_s_px"], errors="coerce").median()),
+                "distance_median_A": float(dist_A.median()) if len(dist_A) else np.nan,
+                "distance_q1_A": float(q1_A) if np.isfinite(q1_A) else np.nan,
+                "distance_q3_A": float(q3_A) if np.isfinite(q3_A) else np.nan,
+                "distance_iqr_A": float(q3_A - q1_A) if np.isfinite(q1_A) and np.isfinite(q3_A) else np.nan,
+                "distance_median_px": float(dist_px.median()) if len(dist_px) else np.nan,
+                "distance_q1_px": float(q1_px) if np.isfinite(q1_px) else np.nan,
+                "distance_q3_px": float(q3_px) if np.isfinite(q3_px) else np.nan,
+                "distance_iqr_px": float(q3_px - q1_px) if np.isfinite(q1_px) and np.isfinite(q3_px) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)[columns]
+
+
+def compute_group_centroids_by_roi(
+    analysis_points: pd.DataFrame,
+    *,
+    center_groups: dict[str, tuple[int, ...] | list[int]],
+    roi_ids: tuple[str, ...] | list[str] | None = None,
+    min_points: int = 1,
+) -> pd.DataFrame:
+    """Compute unweighted geometric centroids for Task 3 class groups."""
+
+    if roi_ids is None:
+        roi_ids = tuple(str(value) for value in analysis_points["roi_id"].dropna().astype(str).unique())
+    rows: list[dict[str, Any]] = []
+    for roi_id in roi_ids:
+        roi_points = select_points_by_roi_and_class(analysis_points, roi_ids=(str(roi_id),), point_set="atoms")
+        roi_name = roi_points["roi_name"].iloc[0] if not roi_points.empty and "roi_name" in roi_points.columns else str(roi_id)
+        for group_name, class_ids_value in center_groups.items():
+            class_ids = tuple(int(value) for value in class_ids_value)
+            group = roi_points.loc[roi_points["class_id"].isin(class_ids)].copy() if "class_id" in roi_points.columns else pd.DataFrame()
+            valid = len(group) >= int(min_points)
+            rows.append(
+                {
+                    "roi_id": str(roi_id),
+                    "roi_name": roi_name,
+                    "group_name": str(group_name),
+                    "class_ids": ",".join(str(value) for value in class_ids),
+                    "n_points": int(len(group)),
+                    "center_x": float(group["x_px"].mean()) if valid else np.nan,
+                    "center_y": float(group["y_px"].mean()) if valid else np.nan,
+                    "center_x_std": float(group["x_px"].std(ddof=1)) if len(group) > 1 else np.nan,
+                    "center_y_std": float(group["y_px"].std(ddof=1)) if len(group) > 1 else np.nan,
+                    "valid": bool(valid),
+                    "invalid_reason": "" if valid else "not_enough_points",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def compute_group_pair_displacements(
+    group_centroid_table: pd.DataFrame,
+    *,
+    center_pairs: tuple[tuple[str, str], ...] | list[tuple[str, str]],
+    pixel_to_nm: float | None = None,
+) -> pd.DataFrame:
+    columns = [
+        "roi_id",
+        "roi_name",
+        "group_A",
+        "group_B",
+        "center_A_x",
+        "center_A_y",
+        "center_B_x",
+        "center_B_y",
+        "dx_px",
+        "dy_px",
+        "distance_px",
+        "distance_A",
+        "angle_deg",
+        "valid",
+        "invalid_reason",
+    ]
+    if group_centroid_table is None or group_centroid_table.empty:
+        return pd.DataFrame(columns=columns)
+    if pixel_to_nm is None:
+        pixel_to_nm = _pixel_to_nm_from_table(group_centroid_table)
+    rows: list[dict[str, Any]] = []
+    for roi_id, group in group_centroid_table.groupby("roi_id", dropna=False, sort=False):
+        roi_name = group["roi_name"].iloc[0] if "roi_name" in group.columns and len(group) else roi_id
+        indexed = group.set_index("group_name", drop=False)
+        for group_A, group_B in center_pairs:
+            reason = ""
+            valid = str(group_A) in indexed.index and str(group_B) in indexed.index
+            if valid:
+                row_A = indexed.loc[str(group_A)]
+                row_B = indexed.loc[str(group_B)]
+                if isinstance(row_A, pd.DataFrame):
+                    row_A = row_A.iloc[0]
+                if isinstance(row_B, pd.DataFrame):
+                    row_B = row_B.iloc[0]
+                valid = bool(row_A.get("valid", False)) and bool(row_B.get("valid", False))
+                if not valid:
+                    reason = "invalid_group_centroid"
+            else:
+                row_A = pd.Series(dtype=object)
+                row_B = pd.Series(dtype=object)
+                reason = "missing_group"
+            if valid:
+                dx = float(row_B["center_x"] - row_A["center_x"])
+                dy = float(row_B["center_y"] - row_A["center_y"])
+                distance_px = float(np.hypot(dx, dy))
+            else:
+                dx = dy = distance_px = np.nan
+            distance_A = distance_px * pixel_to_nm * 10.0 if pixel_to_nm is not None and np.isfinite(distance_px) else np.nan
+            rows.append(
+                {
+                    "roi_id": roi_id,
+                    "roi_name": roi_name,
+                    "group_A": str(group_A),
+                    "group_B": str(group_B),
+                    "center_A_x": row_A.get("center_x", np.nan),
+                    "center_A_y": row_A.get("center_y", np.nan),
+                    "center_B_x": row_B.get("center_x", np.nan),
+                    "center_B_y": row_B.get("center_y", np.nan),
+                    "dx_px": dx,
+                    "dy_px": dy,
+                    "distance_px": distance_px,
+                    "distance_A": distance_A,
+                    "angle_deg": float(np.degrees(np.arctan2(dy, dx))) if valid else np.nan,
+                    "valid": bool(valid),
+                    "invalid_reason": reason,
+                }
+            )
+    return pd.DataFrame(rows)[columns]

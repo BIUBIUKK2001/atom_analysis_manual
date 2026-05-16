@@ -211,6 +211,9 @@ def pick_basis_vectors_with_napari(
     image_key: str = "raw",
     snap_to_nearest_points: bool = True,
     point_size: float = 5.0,
+    rois=None,
+    basis_mode: str = "global",
+    basis_roles: tuple[str, ...] = ("a", "b"),
 ) -> list[BasisVectorSpec]:
     try:
         import napari
@@ -232,8 +235,24 @@ def pick_basis_vectors_with_napari(
         opacity=0.85,
     )
     points_layer.editable = False
+    if str(basis_mode).lower() == "per_roi":
+        roi_records = []
+        for roi in rois or []:
+            if not bool(getattr(roi, "enabled", True)):
+                continue
+            roi_id = str(getattr(roi, "roi_id", "global"))
+            if roi_id == "global":
+                continue
+            for role in basis_roles:
+                roi_records.append({"name": f"{roi_id}_{role}", "roi_id": roi_id, "basis_role": str(role)})
+        if not roi_records:
+            roi_records = [{"name": str(role), "roi_id": None, "basis_role": str(role)} for role in basis_roles]
+    else:
+        roi_records = [{"name": str(name), "roi_id": None, "basis_role": str(name)} for name in basis_names]
+
     palette = plt.get_cmap("tab10")
-    for index, name in enumerate(basis_names):
+    for index, record in enumerate(roi_records):
+        name = record["name"]
         layer = viewer.add_points(
             np.empty((0, 2), dtype=float),
             name=f"basis_{name}",
@@ -251,11 +270,12 @@ def pick_basis_vectors_with_napari(
         viewer.show(block=True)
 
     specs: list[BasisVectorSpec] = []
-    for name in basis_names:
+    for record in roi_records:
+        name = record["name"]
         layer = viewer.layers[f"basis_{name}"]
         data = np.asarray(layer.data, dtype=float)
         if data.shape != (2, 2):
-            raise ValueError(f"Basis vector {name!r} requires exactly two picked points; got shape {data.shape}.")
+            raise ValueError(f"Basis vector {name} requires exactly two picked points.")
         xy_1 = (float(data[0, 1] + origin_x), float(data[0, 0] + origin_y))
         xy_2 = (float(data[1, 1] + origin_x), float(data[1, 0] + origin_y))
         if snap_to_nearest_points:
@@ -267,6 +287,8 @@ def pick_basis_vectors_with_napari(
                 from_xy_px=(xy_1, xy_2),
                 snap_to_nearest_points=False,
                 use_length_as_period=True,
+                roi_id=record.get("roi_id"),
+                basis_role=record.get("basis_role"),
             )
         )
     return specs

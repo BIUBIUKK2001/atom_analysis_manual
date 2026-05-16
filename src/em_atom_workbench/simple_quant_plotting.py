@@ -5,12 +5,12 @@ from typing import Any
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection, PatchCollection
-from matplotlib.patches import Polygon, Rectangle
+from matplotlib.patches import FancyArrowPatch, Polygon, Rectangle
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from .styles import apply_publication_style
+from .styles import FigureStyleConfig, apply_publication_style, coerce_figure_style
 
 
 def _prepare_axes(ax=None, figsize: tuple[float, float] = (5.5, 5.5)):
@@ -210,6 +210,137 @@ def draw_text_summary(side_ax, lines: list[str] | tuple[str, ...]) -> None:
     for line in lines:
         y = _next_side_y(side_ax, 0.040)
         side_ax.text(0.0, y, str(line), transform=side_ax.transAxes, fontsize=8, va="top")
+
+
+def _coerce_polygon(value: Any):
+    if value is None or value is pd.NA:
+        return None
+    if isinstance(value, np.ndarray):
+        polygon = value.astype(float)
+    elif isinstance(value, (list, tuple)):
+        polygon = np.asarray(value, dtype=float)
+    else:
+        return None
+    if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2:
+        return None
+    return polygon
+
+
+def _roi_outline_records(rois_or_points) -> list[dict[str, Any]]:
+    if rois_or_points is None:
+        return []
+    if isinstance(rois_or_points, pd.DataFrame):
+        if rois_or_points.empty or "roi_id" not in rois_or_points.columns:
+            return []
+        records = []
+        columns = [column for column in ("roi_id", "roi_name", "roi_color", "polygon_xy_px") if column in rois_or_points.columns]
+        for _, row in rois_or_points[columns].drop_duplicates("roi_id").iterrows():
+            records.append(
+                {
+                    "roi_id": row.get("roi_id", "global"),
+                    "roi_name": row.get("roi_name", row.get("roi_id", "global")),
+                    "roi_color": row.get("roi_color", "#ff9f1c"),
+                    "polygon_xy_px": row.get("polygon_xy_px", None),
+                }
+            )
+        return records
+    records = []
+    for roi in rois_or_points:
+        records.append(
+            {
+                "roi_id": getattr(roi, "roi_id", "global"),
+                "roi_name": getattr(roi, "roi_name", None) or getattr(roi, "roi_id", "global"),
+                "roi_color": getattr(roi, "color", "#ff9f1c"),
+                "polygon_xy_px": getattr(roi, "polygon_xy_px", None),
+                "enabled": getattr(roi, "enabled", True),
+            }
+        )
+    return records
+
+
+def plot_roi_outlines_on_image(
+    ax,
+    rois_or_points,
+    *,
+    show_roi_labels: bool = True,
+    label_mode: str = "outside",
+    linewidth: float = 1.8,
+    alpha: float = 0.95,
+    zorder: int = 5,
+):
+    artists = []
+    for record in _roi_outline_records(rois_or_points):
+        if not bool(record.get("enabled", True)):
+            continue
+        if str(record.get("roi_id", "")) == "global":
+            continue
+        polygon = _coerce_polygon(record.get("polygon_xy_px"))
+        if polygon is None:
+            continue
+        color = record.get("roi_color", "#ff9f1c")
+        if not _is_color(color):
+            color = "#ff9f1c"
+        patch = Polygon(polygon, closed=True, fill=False, edgecolor=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+        ax.add_patch(patch)
+        artists.append(patch)
+        if not show_roi_labels or label_mode == "none":
+            continue
+        label = str(record.get("roi_name", record.get("roi_id", "ROI")))
+        x_min, y_min = np.nanmin(polygon, axis=0)
+        x_max, y_max = np.nanmax(polygon, axis=0)
+        if label_mode == "inside":
+            x_label = float((x_min + x_max) / 2.0)
+            y_label = float((y_min + y_max) / 2.0)
+            clip_on = True
+        else:
+            margin = max(4.0, 0.02 * max(abs(float(x_max - x_min)), abs(float(y_max - y_min)), 1.0))
+            x_label = float(x_min)
+            y_label = float(y_min - margin)
+            clip_on = False
+        text = ax.text(
+            x_label,
+            y_label,
+            label,
+            color=color,
+            fontsize=8,
+            weight="bold",
+            clip_on=clip_on,
+            zorder=zorder + 1,
+        )
+        artists.append(text)
+    return artists
+
+
+def summarize_rois_and_points(analysis_points: pd.DataFrame, rois=None) -> pd.DataFrame:
+    if analysis_points is None or analysis_points.empty or "roi_id" not in analysis_points.columns:
+        rows = []
+        for record in _roi_outline_records(rois):
+            rows.append(
+                {
+                    "roi_id": record.get("roi_id", "global"),
+                    "roi_name": record.get("roi_name", record.get("roi_id", "global")),
+                    "point_rows": 0,
+                    "unique_point_count": 0,
+                    "unique_atom_count": 0,
+                    "point_set_count": 0,
+                    "class_count": 0,
+                }
+            )
+        return pd.DataFrame(rows)
+    rows: list[dict[str, Any]] = []
+    for roi_id, group in analysis_points.groupby("roi_id", dropna=False, sort=False):
+        rows.append(
+            {
+                "roi_id": roi_id,
+                "roi_name": group["roi_name"].iloc[0] if "roi_name" in group.columns and len(group) else roi_id,
+                "point_rows": int(len(group)),
+                "unique_point_count": int(group["point_id"].nunique(dropna=True)) if "point_id" in group else int(len(group)),
+                "unique_atom_count": int(group["atom_id"].nunique(dropna=True)) if "atom_id" in group else 0,
+                "point_set_count": int(group["point_set"].nunique(dropna=True)) if "point_set" in group else 0,
+                "class_count": int(group["class_id"].nunique(dropna=True)) if "class_id" in group else 0,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _categorical_color_map(values: pd.Series, palette_name: str = "tab10") -> dict[str, str]:
@@ -471,21 +602,13 @@ def plot_basis_glyph(
         return None
     if anchor == "outside" and side_ax is not None:
         _draw_side_header(side_ax, "Basis")
-        origin = np.asarray([0.20, _next_side_y(side_ax, 0.18) - 0.05])
-        scale = 0.14
-        for index, (_, row) in enumerate(basis_vector_table.head(len(names)).iterrows()):
-            angle = float(row.get("angle_deg", 0.0))
-            direction = np.asarray([np.cos(np.radians(angle)), np.sin(np.radians(angle))])
-            start = origin + np.asarray([0.0, -0.10 * index])
-            end = start + direction * scale
-            side_ax.annotate(
-                "",
-                xy=end,
-                xytext=start,
-                xycoords=side_ax.transAxes,
-                arrowprops={"arrowstyle": "->", "linewidth": 1.6, "color": "#f18f01"},
-            )
-            side_ax.text(end[0] + 0.02, end[1], str(row.get("basis_name", names[index])), transform=side_ax.transAxes, fontsize=8, va="center")
+        for _, row in basis_vector_table.iterrows():
+            length = row.get("length_px", np.nan)
+            period = row.get("period_px", np.nan)
+            angle = row.get("angle_deg", np.nan)
+            line = f"{row.get('basis_name', '')}: L={float(length):.2f}px  P={float(period):.2f}px  angle={float(angle):.1f}deg"
+            y = _next_side_y(side_ax, 0.045)
+            side_ax.text(0.0, y, line, transform=side_ax.transAxes, fontsize=7.5, va="top")
         return side_ax
     if isinstance(anchor, tuple):
         x0, y0 = (float(anchor[0]), float(anchor[1]))
@@ -511,6 +634,281 @@ def plot_basis_glyph(
             )
         return ax
     return None
+
+
+def _finite_value(value: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except Exception:
+        return False
+
+
+def plot_basis_vectors_on_image(
+    ax,
+    basis_vector_table: pd.DataFrame,
+    *,
+    show_labels: bool = True,
+    show_period: bool = True,
+    linewidth: float = 2.2,
+    color: str = "#f18f01",
+    label_mode: str = "outside",
+    zorder: int = 6,
+):
+    if basis_vector_table is None or basis_vector_table.empty:
+        return []
+    artists = []
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    x_center = float(np.mean(xlim))
+    y_center = float(np.mean(ylim))
+    x_span = abs(float(xlim[1] - xlim[0]))
+    y_span = abs(float(ylim[1] - ylim[0]))
+    for _, row in basis_vector_table.iterrows():
+        if _finite_value(row.get("from_x1_px")) and _finite_value(row.get("from_y1_px")):
+            x1 = float(row["from_x1_px"])
+            y1 = float(row["from_y1_px"])
+            if _finite_value(row.get("from_x2_px")) and _finite_value(row.get("from_y2_px")):
+                x2 = float(row["from_x2_px"])
+                y2 = float(row["from_y2_px"])
+            else:
+                x2 = x1 + float(row["vector_x_px"])
+                y2 = y1 + float(row["vector_y_px"])
+        else:
+            x1 = x_center
+            y1 = y_center
+            x2 = x1 + float(row["vector_x_px"])
+            y2 = y1 + float(row["vector_y_px"])
+        arrow = ax.annotate(
+            "",
+            xy=(x2, y2),
+            xytext=(x1, y1),
+            arrowprops={"arrowstyle": "->", "linewidth": linewidth, "color": color},
+            clip_on=False,
+            zorder=zorder,
+        )
+        artists.append(arrow)
+        if not show_labels or label_mode == "none":
+            continue
+        label = str(row.get("basis_name", "basis"))
+        if show_period:
+            label += f"  L={float(row.get('length_px', np.nan)):.2f}px  P={float(row.get('period_px', np.nan)):.2f}px"
+        if label_mode == "near_arrow":
+            x_label = x2 + 0.01 * x_span
+            y_label = y2 - 0.01 * y_span
+            clip_on = False
+        else:
+            x_label = xlim[1] + 0.02 * x_span if (x2 - x1) >= 0 else xlim[0] - 0.22 * x_span
+            y_label = y2
+            clip_on = False
+        text = ax.text(x_label, y_label, label, color=color, fontsize=8, weight="bold", clip_on=clip_on, zorder=zorder + 1)
+        artists.append(text)
+    return artists
+
+
+def _basis_role_from_row(row: pd.Series) -> str:
+    value = row.get("basis_role", pd.NA)
+    if pd.notna(value) and str(value):
+        return str(value)
+    name = str(row.get("basis_name", ""))
+    if "_" in name:
+        return name.rsplit("_", 1)[-1]
+    return name
+
+
+def _roi_color_lookup(rois, points: pd.DataFrame | None = None) -> dict[str, str]:
+    records = _roi_outline_records(rois if rois is not None else points)
+    color_map: dict[str, str] = {}
+    for record in records:
+        roi_id = str(record.get("roi_id", "global"))
+        color = record.get("roi_color", "#f18f01")
+        color_map[roi_id] = str(color) if _is_color(color) else "#f18f01"
+    return color_map
+
+
+def _basis_arrow_color(row: pd.Series, roi_color_map: dict[str, str], fallback_index: int) -> str:
+    roi_id = row.get("roi_id", pd.NA)
+    if pd.notna(roi_id) and str(roi_id) in roi_color_map:
+        return roi_color_map[str(roi_id)]
+    palette = plt.get_cmap("tab10")
+    return mcolors.to_hex(palette(fallback_index % palette.N))
+
+
+def _basis_arrow_endpoints(row: pd.Series, ax) -> tuple[float, float, float, float] | None:
+    if _finite_value(row.get("from_x1_px")) and _finite_value(row.get("from_y1_px")):
+        x1 = float(row["from_x1_px"])
+        y1 = float(row["from_y1_px"])
+        if _finite_value(row.get("from_x2_px")) and _finite_value(row.get("from_y2_px")):
+            return x1, y1, float(row["from_x2_px"]), float(row["from_y2_px"])
+        if _finite_value(row.get("vector_x_px")) and _finite_value(row.get("vector_y_px")):
+            return x1, y1, x1 + float(row["vector_x_px"]), y1 + float(row["vector_y_px"])
+    if _finite_value(row.get("vector_x_px")) and _finite_value(row.get("vector_y_px")):
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        x1 = float(np.mean(xlim))
+        y1 = float(np.mean(ylim))
+        return x1, y1, x1 + float(row["vector_x_px"]), y1 + float(row["vector_y_px"])
+    return None
+
+
+def _draw_compact_basis_check_legend(
+    legend_ax,
+    class_color_map: dict,
+    roi_color_map: dict[str, str],
+    *,
+    fontsize: float = 7.0,
+) -> None:
+    if legend_ax is None:
+        return
+    legend_ax.axis("off")
+    legend_ax.set_xlim(0, 1)
+    legend_ax.set_ylim(0, 1)
+    y = 0.98
+
+    def header(text: str) -> None:
+        nonlocal y
+        legend_ax.text(0.0, y, text, transform=legend_ax.transAxes, fontsize=fontsize + 1.0, weight="bold", va="top")
+        y -= 0.070
+
+    def item_marker(label: str, color: str, marker: str = "point") -> None:
+        nonlocal y
+        if y < 0.04:
+            return
+        if marker == "line":
+            legend_ax.plot([0.0, 0.12], [y - 0.012, y - 0.012], color=color, linewidth=2.4, transform=legend_ax.transAxes)
+        else:
+            legend_ax.scatter([0.035], [y - 0.016], s=18, color=color, edgecolors="black", linewidths=0.2, transform=legend_ax.transAxes)
+        legend_ax.text(0.16, y, str(label), transform=legend_ax.transAxes, fontsize=fontsize, va="top")
+        y -= 0.055
+
+    if class_color_map:
+        header("Classes")
+        for label, color in class_color_map.items():
+            item_marker(str(label), color, "point")
+        y -= 0.030
+    if roi_color_map:
+        header("ROIs / basis")
+        for roi_id, color in roi_color_map.items():
+            if roi_id == "global":
+                continue
+            item_marker(roi_id, color, "line")
+
+
+def plot_basis_check_on_image(
+    image: np.ndarray | None,
+    points: pd.DataFrame,
+    basis_vector_table: pd.DataFrame,
+    *,
+    rois=None,
+    show_atoms: bool = True,
+    atom_size: float = 18.0,
+    atom_alpha: float = 0.85,
+    show_roi_outlines: bool = True,
+    show_roi_labels: bool = False,
+    roi_linewidth: float = 1.8,
+    roi_alpha: float = 0.95,
+    show_basis_labels: bool = False,
+    show_basis_table: bool = False,
+    basis_linewidth: float = 2.4,
+    basis_alpha: float = 0.95,
+    basis_mutation_scale: float = 11.0,
+    show_legend: bool = True,
+    legend_width_ratio: float = 0.16,
+    figsize: tuple[float, float] = (7.6, 5.6),
+    show_axes: bool = False,
+    title: str | None = "ROI and basis vector check",
+):
+    """Draw a clean ROI/class/basis check overlay for notebook previews."""
+    apply_publication_style()
+    if show_legend:
+        fig, (image_ax, legend_ax) = plt.subplots(
+            1,
+            2,
+            figsize=figsize,
+            gridspec_kw={"width_ratios": [1.0, float(legend_width_ratio)]},
+            constrained_layout=True,
+        )
+        legend_ax.axis("off")
+    else:
+        fig, image_ax = plt.subplots(figsize=(figsize[0] * 0.82, figsize[1]), constrained_layout=True)
+        legend_ax = None
+
+    _show_image(image_ax, image, show_axes=show_axes, axis_label_mode="pixel")
+    if show_roi_outlines:
+        plot_roi_outlines_on_image(
+            image_ax,
+            rois if rois is not None else points,
+            show_roi_labels=show_roi_labels,
+            label_mode="outside" if show_roi_labels else "none",
+            linewidth=roi_linewidth,
+            alpha=roi_alpha,
+            zorder=5,
+        )
+
+    class_color_map: dict = {}
+    if show_atoms and points is not None and not points.empty:
+        _, class_color_map = plot_class_colored_atoms(
+            image_ax,
+            points,
+            point_size=atom_size,
+            alpha=atom_alpha,
+            zorder=3,
+        )
+
+    roi_color_map = _roi_color_lookup(rois, points)
+    artists = []
+    if basis_vector_table is not None and not basis_vector_table.empty:
+        for index, (_, row) in enumerate(basis_vector_table.iterrows()):
+            endpoints = _basis_arrow_endpoints(row, image_ax)
+            if endpoints is None:
+                continue
+            x1, y1, x2, y2 = endpoints
+            color = _basis_arrow_color(row, roi_color_map, index)
+            role = _basis_role_from_row(row).lower()
+            linestyle = "--" if role == "b" else "-"
+            arrow = FancyArrowPatch(
+                (x1, y1),
+                (x2, y2),
+                arrowstyle="-|>",
+                mutation_scale=basis_mutation_scale,
+                linewidth=basis_linewidth,
+                linestyle=linestyle,
+                color=color,
+                alpha=basis_alpha,
+                shrinkA=0.0,
+                shrinkB=0.0,
+                zorder=7,
+            )
+            image_ax.add_patch(arrow)
+            artists.append(arrow)
+            if show_basis_labels:
+                image_ax.text(
+                    x2,
+                    y2,
+                    str(row.get("basis_name", "basis")),
+                    color=color,
+                    fontsize=7,
+                    weight="bold",
+                    va="bottom",
+                    ha="left",
+                    clip_on=False,
+                    zorder=8,
+                )
+
+    if legend_ax is not None:
+        _draw_compact_basis_check_legend(legend_ax, class_color_map, roi_color_map)
+        if show_basis_table and basis_vector_table is not None and not basis_vector_table.empty:
+            y0 = 0.02
+            legend_ax.text(
+                0.0,
+                y0,
+                f"basis: {len(basis_vector_table)}",
+                transform=legend_ax.transAxes,
+                fontsize=7,
+                va="bottom",
+            )
+    if title:
+        image_ax.set_title(title)
+    return fig, image_ax, legend_ax
 
 
 def _segment_colors(data: pd.DataFrame, color_by: str, fixed_color: str) -> tuple[list[str] | None, dict[str, str]]:
@@ -550,6 +948,13 @@ def plot_measurement_segments_on_image(
     *,
     basis_vector_table: pd.DataFrame | None = None,
     line_guides: pd.DataFrame | None = None,
+    rois=None,
+    show_roi_outlines: bool = True,
+    roi_label_mode: str = "outside",
+    roi_linewidth: float = 1.8,
+    roi_alpha: float = 0.95,
+    show_basis_vectors: bool = True,
+    basis_label_mode: str = "outside",
     color_by: str = "task",
     fixed_color: str = "#ff9f1c",
     value_column: str = "distance_pm",
@@ -569,6 +974,14 @@ def plot_measurement_segments_on_image(
         fig, image_ax = _prepare_axes(figsize=(6.0, 6.0))
         side_ax = None
     _show_image(image_ax, image, show_axes=show_axes, axis_label_mode="pixel")
+    if show_roi_outlines:
+        plot_roi_outlines_on_image(
+            image_ax,
+            rois if rois is not None else points,
+            label_mode=roi_label_mode,
+            linewidth=roi_linewidth,
+            alpha=roi_alpha,
+        )
     class_color_map = {}
     if show_atoms and points is not None and not points.empty:
         _, class_color_map = plot_class_colored_atoms(image_ax, points, point_size=atom_size, zorder=3)
@@ -599,15 +1012,21 @@ def plot_measurement_segments_on_image(
         guide_lines = line_guides[["line_start_x_px", "line_start_y_px", "line_end_x_px", "line_end_y_px"]].to_numpy(dtype=float).reshape(-1, 2, 2)
         image_ax.add_collection(LineCollection(guide_lines, colors="#f18f01", linewidths=1.2, alpha=0.55, zorder=2))
     if basis_vector_table is not None:
+        if show_basis_vectors:
+            plot_basis_vectors_on_image(image_ax, basis_vector_table, label_mode=basis_label_mode)
         plot_basis_glyph(image_ax, basis_vector_table, side_ax=side_ax)
     if side_ax is not None:
         draw_class_legend(side_ax, class_color_map)
         draw_roi_legend(side_ax, points)
         draw_task_legend(side_ax, task_color_map)
+        unique_points = int(points["point_id"].nunique(dropna=True)) if points is not None and "point_id" in points else 0
+        unique_atoms = int(points["atom_id"].nunique(dropna=True)) if points is not None and "atom_id" in points else 0
         draw_text_summary(
             side_ax,
             [
-                f"points: {0 if points is None else len(points)}",
+                f"ROI-expanded rows: {0 if points is None else len(points)}",
+                f"unique points: {unique_points}",
+                f"unique atoms: {unique_atoms}",
                 f"segments: {0 if segments is None else len(segments)}",
                 f"color_by: {color_by}",
             ],
@@ -623,6 +1042,11 @@ def plot_line_guides_on_image(
     line_guides: pd.DataFrame,
     *,
     basis_vector_table: pd.DataFrame | None = None,
+    rois=None,
+    show_roi_outlines: bool = True,
+    roi_label_mode: str = "outside",
+    show_basis_vectors: bool = True,
+    basis_label_mode: str = "outside",
     show_atoms: bool = True,
     line_color_by: str = "roi",
     line_width: float = 1.5,
@@ -641,6 +1065,8 @@ def plot_line_guides_on_image(
         fig, image_ax = _prepare_axes(figsize=(6.0, 6.0))
         side_ax = None
     _show_image(image_ax, image, show_axes=show_axes, axis_label_mode="pixel")
+    if show_roi_outlines:
+        plot_roi_outlines_on_image(image_ax, rois if rois is not None else points, label_mode=roi_label_mode)
     class_color_map = {}
     if show_atoms and points is not None and not points.empty:
         _, class_color_map = plot_class_colored_atoms(image_ax, points, point_size=18.0, zorder=3)
@@ -678,6 +1104,8 @@ def plot_line_guides_on_image(
                     zorder=5,
                 )
     if basis_vector_table is not None:
+        if show_basis_vectors:
+            plot_basis_vectors_on_image(image_ax, basis_vector_table, label_mode=basis_label_mode)
         plot_basis_glyph(image_ax, basis_vector_table, side_ax=side_ax)
     if side_ax is not None:
         draw_class_legend(side_ax, class_color_map)
@@ -778,4 +1206,330 @@ def plot_line_width_summary(
     ax.set_ylabel(value_column)
     if title:
         ax.set_title(title)
+    return fig, ax
+
+
+def _gaussian_curve(x_values: np.ndarray, mean: float, std: float, count: int, bin_width: float) -> np.ndarray:
+    if not np.isfinite(mean) or not np.isfinite(std) or std <= 0.0 or count <= 0:
+        return np.full_like(x_values, np.nan, dtype=float)
+    coefficient = float(count) * float(bin_width) / (std * np.sqrt(2.0 * np.pi))
+    return coefficient * np.exp(-0.5 * ((x_values - mean) / std) ** 2)
+
+
+def _plot_gaussian_histogram(
+    table: pd.DataFrame,
+    value_column: str,
+    *,
+    group_columns: tuple[str, ...],
+    xlabel: str,
+    title_prefix: str,
+    bins: int = 24,
+    style: FigureStyleConfig | dict | None = None,
+) -> dict[str, Any]:
+    from .simple_quant import fit_single_gaussian_to_histogram
+
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    figures: dict[str, Any] = {}
+    data = table.copy() if table is not None else pd.DataFrame()
+    if data.empty or value_column not in data.columns:
+        return figures
+    if "valid" in data.columns:
+        data = data.loc[data["valid"].astype(bool)].copy()
+    data[value_column] = pd.to_numeric(data[value_column], errors="coerce")
+    data = data.loc[data[value_column].notna()]
+    if data.empty:
+        return figures
+    for keys, group in data.groupby(list(group_columns), dropna=False, sort=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        values = group[value_column].dropna().to_numpy(dtype=float)
+        if values.size == 0:
+            continue
+        stats = fit_single_gaussian_to_histogram(values)
+        fig, ax = plt.subplots(figsize=(4.3, 3.2), constrained_layout=True)
+        counts, edges, _ = ax.hist(
+            values,
+            bins=min(int(bins), max(5, int(np.sqrt(values.size) * 2))),
+            color=config.histogram_color,
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.82,
+        )
+        if len(edges) > 1 and np.isfinite(stats["std"]) and stats["std"] > 0:
+            x_values = np.linspace(float(edges[0]), float(edges[-1]), 300)
+            fit_y = _gaussian_curve(x_values, float(stats["mean"]), float(stats["std"]), int(stats["n"]), float(np.mean(np.diff(edges))))
+            ax.plot(x_values, fit_y, color=config.fit_color, linewidth=config.line_width + 0.5, label="Gaussian fit")
+        median = stats["median"]
+        robust = stats["robust_std"]
+        if np.isfinite(median):
+            ax.axvline(float(median), color="#2ca25f", linewidth=config.line_width, linestyle="--", label="median")
+        annotation = f"median = {median:.3g}\nrobust std = {robust:.3g}" if np.isfinite(robust) else f"median = {median:.3g}"
+        ax.text(0.98, 0.95, annotation, transform=ax.transAxes, ha="right", va="top", fontsize=config.legend_size)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Counts")
+        ax.set_title(title_prefix)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(frameon=False, loc="best")
+        stem = "_".join(str(value).replace(":", "_").replace("+", "_").replace(" ", "_") for value in keys)
+        figures[f"{title_prefix}_{stem}_{value_column}"] = fig
+    return figures
+
+
+def plot_period_length_histograms(
+    period_segment_table: pd.DataFrame,
+    *,
+    bins: int = 24,
+    style: FigureStyleConfig | dict | None = None,
+) -> dict[str, Any]:
+    value_column = "length_A" if period_segment_table is not None and "length_A" in period_segment_table.columns and period_segment_table["length_A"].notna().any() else "length_px"
+    xlabel = "Period length (Å)" if value_column == "length_A" else "Period length (px)"
+    return _plot_gaussian_histogram(
+        period_segment_table,
+        value_column,
+        group_columns=("roi_id", "direction", "class_selection"),
+        xlabel=xlabel,
+        title_prefix="task1A_period_length",
+        bins=bins,
+        style=style,
+    )
+
+
+def plot_period_angle_delta_histograms(
+    period_segment_table: pd.DataFrame,
+    *,
+    bins: int = 24,
+    style: FigureStyleConfig | dict | None = None,
+) -> dict[str, Any]:
+    return _plot_gaussian_histogram(
+        period_segment_table,
+        "angle_delta_deg",
+        group_columns=("roi_id", "direction", "class_selection"),
+        xlabel="Angle deviation (°)",
+        title_prefix="task1A_angle_delta",
+        bins=bins,
+        style=style,
+    )
+
+
+def plot_projection_spacing_histogram(
+    pair_line_table: pd.DataFrame,
+    *,
+    style: FigureStyleConfig | dict | None = None,
+):
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    fig, ax = plt.subplots(figsize=(4.5, 3.2), constrained_layout=True)
+    data = pair_line_table.copy() if pair_line_table is not None else pd.DataFrame()
+    if not data.empty and "projection_s_px" in data.columns:
+        for roi_id, group in data.groupby("roi_id", dropna=False, sort=False):
+            s = pd.to_numeric(group["projection_s_px"], errors="coerce").dropna().sort_values().to_numpy(dtype=float)
+            gaps = np.diff(s)
+            gaps = gaps[np.isfinite(gaps) & (gaps > 1e-9)]
+            if gaps.size:
+                ax.hist(gaps, bins=min(24, max(5, int(np.sqrt(gaps.size) * 2))), alpha=0.65, label=str(roi_id))
+    ax.set_xlabel("Adjacent projection spacing (px)")
+    ax.set_ylabel("Counts")
+    ax.set_title("Task 2 projection spacing QC")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if ax.has_data():
+        ax.legend(frameon=False)
+    return fig, ax
+
+
+def plot_pair_line_distance_errorbar(
+    pair_line_summary_table: pd.DataFrame,
+    pair_line_table: pd.DataFrame | None = None,
+    *,
+    style: FigureStyleConfig | dict | None = None,
+    title: str = "Task 2 pair distance by line",
+):
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    fig, ax = plt.subplots(figsize=(4.8, 3.4), constrained_layout=True)
+    summary = pair_line_summary_table.copy() if pair_line_summary_table is not None else pd.DataFrame()
+    if not summary.empty:
+        value_column = "distance_median_A" if summary["distance_median_A"].notna().any() else "distance_median_px"
+        q1_column = "distance_q1_A" if value_column.endswith("_A") else "distance_q1_px"
+        q3_column = "distance_q3_A" if value_column.endswith("_A") else "distance_q3_px"
+        ylabel = "Pair distance (Å)" if value_column.endswith("_A") else "Pair distance (px)"
+        for roi_id, group in summary.groupby("roi_id", dropna=False, sort=False):
+            group = group.sort_values("line_id")
+            x = pd.to_numeric(group["line_id"], errors="coerce").to_numpy(dtype=float)
+            y = pd.to_numeric(group[value_column], errors="coerce").to_numpy(dtype=float)
+            yerr = np.vstack(
+                [
+                    y - pd.to_numeric(group[q1_column], errors="coerce").to_numpy(dtype=float),
+                    pd.to_numeric(group[q3_column], errors="coerce").to_numpy(dtype=float) - y,
+                ]
+            )
+            ax.errorbar(x, y, yerr=yerr, marker="o", markersize=4, linewidth=config.line_width, capsize=3, label=str(roi_id))
+        if pair_line_table is not None and not pair_line_table.empty:
+            raw = pair_line_table.loc[pair_line_table.get("line_valid", False).astype(bool)].copy()
+            if not raw.empty and "line_id" in raw.columns:
+                raw_value = "distance_A" if "distance_A" in raw.columns and raw["distance_A"].notna().any() else "distance_px"
+                ax.scatter(
+                    pd.to_numeric(raw["line_id"], errors="coerce"),
+                    pd.to_numeric(raw[raw_value], errors="coerce"),
+                    s=8,
+                    color="0.25",
+                    alpha=0.20,
+                    zorder=1,
+                )
+        ax.set_ylabel(ylabel)
+    ax.set_xlabel("Line index")
+    ax.set_title(title)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if summary is not None and not summary.empty:
+        ax.legend(frameon=False)
+    return fig, ax
+
+
+def plot_pair_overlay(
+    image: np.ndarray | None,
+    pair_table: pd.DataFrame,
+    *,
+    rois=None,
+    style: FigureStyleConfig | dict | None = None,
+    title: str = "Task 2 pair overlay",
+):
+    config = coerce_figure_style(style)
+    fig, ax = _prepare_axes(figsize=(5.5, 5.5))
+    apply_publication_style(config)
+    _show_image(ax, image)
+    plot_roi_outlines_on_image(ax, rois, label_mode="none")
+    data = pair_table.copy() if pair_table is not None else pd.DataFrame()
+    if not data.empty:
+        required = ["p1_x", "p1_y", "p2_x", "p2_y", "center_x", "center_y"]
+        data = data.dropna(subset=[col for col in required if col in data.columns])
+        if all(col in data.columns for col in required):
+            lines = data[["p1_x", "p1_y", "p2_x", "p2_y"]].to_numpy(dtype=float).reshape(-1, 2, 2)
+            colors = np.where(data.get("valid", True).astype(bool), "#4c78a8", "#bdbdbd")
+            ax.add_collection(LineCollection(lines, colors=colors, linewidths=config.line_width, alpha=0.75, zorder=4))
+            ax.scatter(data["center_x"], data["center_y"], s=config.marker_size, c="#d95f02", edgecolors="white", linewidths=0.25, zorder=5)
+    ax.set_title(title)
+    return fig, ax
+
+
+def plot_pair_center_line_assignment(
+    image: np.ndarray | None,
+    pair_line_table: pd.DataFrame,
+    *,
+    rois=None,
+    style: FigureStyleConfig | dict | None = None,
+    title: str = "Task 2 pair-center line assignment",
+):
+    config = coerce_figure_style(style)
+    fig, ax = _prepare_axes(figsize=(5.5, 5.5))
+    apply_publication_style(config)
+    _show_image(ax, image)
+    plot_roi_outlines_on_image(ax, rois, label_mode="none")
+    data = pair_line_table.copy() if pair_line_table is not None else pd.DataFrame()
+    if not data.empty and {"center_x", "center_y", "line_id"}.issubset(data.columns):
+        valid = data.loc[data.get("line_valid", False).astype(bool)].copy()
+        if not valid.empty:
+            labels = valid["line_id"].astype(str)
+            color_map = _categorical_color_map(labels, "tab20")
+            colors = [color_map[str(label)] for label in labels]
+            ax.scatter(valid["center_x"], valid["center_y"], s=config.marker_size, c=colors, edgecolors="white", linewidths=0.25, zorder=5)
+    ax.set_title(title)
+    return fig, ax
+
+
+def plot_polygon_cell_map(
+    image: np.ndarray | None,
+    cell_table: pd.DataFrame,
+    value_column: str,
+    *,
+    rois=None,
+    style: FigureStyleConfig | dict | None = None,
+    title: str | None = None,
+    cmap: str | None = None,
+    alpha: float | None = None,
+    edgecolor: str = "none",
+    symmetric: bool | None = None,
+):
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    fig, ax = _prepare_axes(figsize=(5.5, 5.5))
+    _show_image(ax, image)
+    plot_roi_outlines_on_image(ax, rois, label_mode="none", linewidth=1.0, alpha=0.7)
+    data = cell_table.copy() if cell_table is not None else pd.DataFrame()
+    if not data.empty and value_column in data.columns:
+        data = data.loc[data.get("valid", False).astype(bool)].copy()
+        data[value_column] = pd.to_numeric(data[value_column], errors="coerce")
+        data = data.dropna(subset=[value_column])
+        patches = []
+        for _, row in data.iterrows():
+            vertices = np.asarray(
+                [
+                    [row["p00_x"], row["p00_y"]],
+                    [row["p10_x"], row["p10_y"]],
+                    [row["p11_x"], row["p11_y"]],
+                    [row["p01_x"], row["p01_y"]],
+                ],
+                dtype=float,
+            )
+            patches.append(Polygon(vertices, closed=True))
+        if patches:
+            values = data[value_column].to_numpy(dtype=float)[: len(patches)]
+            if symmetric is None:
+                symmetric = str(value_column).startswith("eps_")
+            if cmap is None:
+                cmap = "coolwarm" if symmetric else "viridis"
+            collection = PatchCollection(patches, cmap=cmap, alpha=config.overlay_alpha if alpha is None else alpha, edgecolor=edgecolor, linewidth=0.25)
+            collection.set_array(values)
+            if symmetric:
+                vmax = float(np.nanmax(np.abs(values))) if values.size else 1.0
+                collection.set_clim(-vmax, vmax)
+            ax.add_collection(collection)
+            label = value_column
+            if str(value_column).startswith("eps_"):
+                label = f"{value_column} (%)"
+                collection.set_array(values * 100.0)
+                if symmetric:
+                    vmax = float(np.nanmax(np.abs(values * 100.0))) if values.size else 1.0
+                    collection.set_clim(-vmax, vmax)
+            _add_colorbar(fig, ax, collection, label)
+    ax.set_title(title or value_column)
+    return fig, ax
+
+
+def plot_group_centers_and_displacements(
+    image: np.ndarray | None,
+    group_centroid_table: pd.DataFrame,
+    group_displacement_table: pd.DataFrame,
+    *,
+    rois=None,
+    style: FigureStyleConfig | dict | None = None,
+    title: str = "Task 3 group centers and displacements",
+):
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    fig, ax = _prepare_axes(figsize=(5.5, 5.5))
+    _show_image(ax, image)
+    plot_roi_outlines_on_image(ax, rois, label_mode="outside", linewidth=1.0, alpha=0.75)
+    centers = group_centroid_table.copy() if group_centroid_table is not None else pd.DataFrame()
+    if not centers.empty:
+        centers = centers.loc[centers.get("valid", False).astype(bool)].copy()
+        if not centers.empty:
+            color_map = _categorical_color_map(centers["group_name"].astype(str), "tab10")
+            for group_name, group in centers.groupby("group_name", sort=False):
+                ax.scatter(group["center_x"], group["center_y"], s=config.marker_size * 2.0, c=color_map[str(group_name)], edgecolors="white", linewidths=0.5, label=str(group_name), zorder=5)
+    displacements = group_displacement_table.copy() if group_displacement_table is not None else pd.DataFrame()
+    if not displacements.empty:
+        for _, row in displacements.loc[displacements.get("valid", False).astype(bool)].iterrows():
+            ax.annotate(
+                "",
+                xy=(float(row["center_B_x"]), float(row["center_B_y"])),
+                xytext=(float(row["center_A_x"]), float(row["center_A_y"])),
+                arrowprops={"arrowstyle": "->", "linewidth": config.line_width, "color": "#d95f02"},
+                zorder=6,
+            )
+    if centers is not None and not centers.empty:
+        ax.legend(frameon=False, loc="best")
+    ax.set_title(title)
     return fig, ax

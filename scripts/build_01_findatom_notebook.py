@@ -307,6 +307,61 @@ else:
 """,
         ),
         by_id["checkpoint-stage"],
+        md(
+            "final-excel-export-md",
+            """
+## 9. 导出最终原子表 Excel
+
+这一格只读取当前 `session.curated_points` 或已保存的 active session，并把最终原子坐标、类别、拟合残差、质量分数和 flag 整理到一个 `.xlsx`。它不会重新运行检测、分类、精修或 curation，因此可以在前面流程跑完后单独执行。
+""",
+        ),
+        code(
+            "final-excel-export-stage",
+            """
+# EXPORT_FINAL_EXCEL：是否导出最终 curated_points 到 Excel。
+# 只写文件，不改变 session，不会重跑前面的处理流程。
+EXPORT_FINAL_EXCEL = True
+
+# FINAL_EXCEL_FILENAME：输出到 RESULT_ROOT / '01_findatom' / 'tables' 下的文件名。
+# Excel 内包含 all_curated_points、kept_points、class_summary、flag_summary、metadata。
+FINAL_EXCEL_FILENAME = '01_final_atom_columns.xlsx'
+
+from pathlib import Path
+import sys
+
+_cwd = Path.cwd().resolve()
+_project_root = next((p for p in (_cwd, *_cwd.parents) if (p / 'src' / 'em_atom_workbench').exists()), _cwd)
+_src_dir = _project_root / 'src'
+if str(_src_dir) not in sys.path:
+    sys.path.insert(0, str(_src_dir))
+
+for _module_name in list(sys.modules):
+    if _module_name == 'em_atom_workbench' or _module_name.startswith('em_atom_workbench.'):
+        sys.modules.pop(_module_name, None)
+
+from em_atom_workbench.session import AnalysisSession
+from em_atom_workbench.notebook_workflows import display_notebook_result, export_final_atom_table_excel
+
+RESULT_ROOT = _project_root / 'results'
+
+# CHECKPOINT_PATH：最终 checkpoint 路径。
+# 如果当前 kernel 丢了变量，直接填这里，然后只运行本 cell 即可导出。
+CHECKPOINT_PATH = None
+
+if EXPORT_FINAL_EXCEL:
+    if CHECKPOINT_PATH is None:
+        raise ValueError('Please set CHECKPOINT_PATH to your saved final checkpoint .pkl file.')
+    session = AnalysisSession.load_pickle(CHECKPOINT_PATH)
+    result = export_final_atom_table_excel(
+        session,
+        result_root=RESULT_ROOT,
+        filename=FINAL_EXCEL_FILENAME,
+    )
+    display_notebook_result(result)
+else:
+    print('EXPORT_FINAL_EXCEL=False；未导出 Excel。')
+""",
+        ),
     ]
 
 
@@ -357,6 +412,7 @@ from em_atom_workbench import (
     PixelCalibration,
     RefinementConfig,
     save_checkpoint,
+    load_or_connect_session,
 )
 from em_atom_workbench.plotting import launch_refinement_napari_viewer
 from em_atom_workbench.notebook_workflows import (
@@ -367,6 +423,7 @@ from em_atom_workbench.notebook_workflows import (
     run_generic_curation,
     run_generic_refinement,
     review_generic_candidates,
+    export_final_atom_table_excel,
     save_final_checkpoint_if_requested,
     show_atom_column_class_review,
 )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
 
@@ -614,3 +615,337 @@ def compute_local_affine_strain(
         },
     )
     return session
+
+
+def _point_identifier(row: pd.Series) -> str:
+    value = row.get("point_id", pd.NA)
+    if pd.notna(value):
+        return str(value)
+    atom_id = row.get("atom_id", pd.NA)
+    return f"atom:{int(atom_id)}" if pd.notna(atom_id) else str(row.name)
+
+
+def _unit_vector(vector: object, name: str) -> np.ndarray:
+    value = np.asarray(vector, dtype=float)
+    if value.shape != (2,) or not np.isfinite(value).all():
+        raise ValueError(f"{name} must be a finite 2D vector.")
+    norm = float(np.linalg.norm(value))
+    if norm <= _SINGULAR_TOLERANCE:
+        raise ValueError(f"{name} must be non-zero.")
+    return value / norm
+
+
+def resolve_anchor_period_references(
+    period_summary_table: pd.DataFrame,
+    anchor_selection: dict[str, int | tuple[int, ...] | list[int]],
+) -> pd.DataFrame:
+    """Resolve Task 1B a/b references from same-ROI, same-anchor-class Task 1A rows."""
+
+    columns = ["roi_id", "anchor_class_id", "a_ref_px", "b_ref_px", "valid", "invalid_reason"]
+    if period_summary_table is None or period_summary_table.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "roi_id": roi_id,
+                    "anchor_class_id": ",".join(str(v) for v in (value if isinstance(value, (list, tuple)) else [value])),
+                    "a_ref_px": np.nan,
+                    "b_ref_px": np.nan,
+                    "valid": False,
+                    "invalid_reason": "missing_period_summary",
+                }
+                for roi_id, value in anchor_selection.items()
+            ],
+            columns=columns,
+        )
+    rows: list[dict[str, object]] = []
+    for roi_id, class_value in anchor_selection.items():
+        class_ids = tuple(int(v) for v in (class_value if isinstance(class_value, (list, tuple)) else (class_value,)))
+        if len(class_ids) != 1:
+            rows.append(
+                {
+                    "roi_id": roi_id,
+                    "anchor_class_id": ",".join(str(v) for v in class_ids),
+                    "a_ref_px": np.nan,
+                    "b_ref_px": np.nan,
+                    "valid": False,
+                    "invalid_reason": "anchor_reference_requires_single_class",
+                }
+            )
+            continue
+        label = f"class_id:{class_ids[0]}"
+        matched = period_summary_table.loc[
+            (period_summary_table["roi_id"].astype(str) == str(roi_id))
+            & (period_summary_table["class_selection"].astype(str) == label)
+        ]
+        a_rows = matched.loc[matched["direction"].astype(str) == "a"]
+        b_rows = matched.loc[matched["direction"].astype(str) == "b"]
+        valid = not a_rows.empty and not b_rows.empty
+        rows.append(
+            {
+                "roi_id": roi_id,
+                "anchor_class_id": class_ids[0],
+                "a_ref_px": float(a_rows.iloc[0]["length_median_px"]) if not a_rows.empty else np.nan,
+                "b_ref_px": float(b_rows.iloc[0]["length_median_px"]) if not b_rows.empty else np.nan,
+                "valid": bool(valid),
+                "invalid_reason": "" if valid else "missing_anchor_period_reference",
+            }
+        )
+    return pd.DataFrame(rows)[columns]
+
+
+def assign_lattice_indices(
+    anchor_points: pd.DataFrame,
+    *,
+    a_ref_px: float,
+    b_ref_px: float,
+    unit_a: tuple[float, float] | np.ndarray,
+    unit_b: tuple[float, float] | np.ndarray,
+    origin_point_id: str | None = None,
+    origin_xy: tuple[float, float] | None = None,
+    max_residual_fraction: float = 0.35,
+) -> pd.DataFrame:
+    """Assign integer lattice coordinates to anchor sublattice points."""
+
+    columns = list(anchor_points.columns) + [
+        "lattice_i",
+        "lattice_j",
+        "ideal_x",
+        "ideal_y",
+        "lattice_residual_px",
+        "lattice_residual_fraction",
+        "valid_anchor",
+        "anchor_invalid_reason",
+        "origin_x",
+        "origin_y",
+    ]
+    if anchor_points is None or anchor_points.empty:
+        return pd.DataFrame(columns=columns)
+    a_ref_px = float(a_ref_px)
+    b_ref_px = float(b_ref_px)
+    if not np.isfinite(a_ref_px) or not np.isfinite(b_ref_px) or a_ref_px <= 0 or b_ref_px <= 0:
+        raise ValueError("a_ref_px and b_ref_px must be positive finite values.")
+    ua = _unit_vector(unit_a, "unit_a")
+    ub = _unit_vector(unit_b, "unit_b")
+    basis = np.column_stack([ua * a_ref_px, ub * b_ref_px])
+    if abs(float(np.linalg.det(basis))) <= _SINGULAR_TOLERANCE:
+        raise ValueError("Task 1B a/b reference basis is singular; check selected basis vectors.")
+    points = anchor_points.copy().reset_index(drop=True)
+    if "point_id" not in points.columns:
+        points["point_id"] = [_point_identifier(row) for _, row in points.iterrows()]
+    if origin_xy is None:
+        if origin_point_id is not None:
+            match = points.loc[points["point_id"].astype(str) == str(origin_point_id)]
+            if match.empty:
+                raise ValueError(f"origin_point_id {origin_point_id!r} was not found in anchor_points.")
+            origin_xy = (float(match.iloc[0]["x_px"]), float(match.iloc[0]["y_px"]))
+        else:
+            coords = points[["x_px", "y_px"]].to_numpy(dtype=float)
+            projections = coords @ (ua + ub)
+            origin_index = int(np.nanargmin(projections))
+            origin_xy = (float(coords[origin_index, 0]), float(coords[origin_index, 1]))
+    origin = np.asarray(origin_xy, dtype=float)
+    coords = points[["x_px", "y_px"]].to_numpy(dtype=float)
+    fractional = np.linalg.solve(basis, (coords - origin).T).T
+    ij = np.rint(fractional).astype(int)
+    ideal = origin + (basis @ ij.T).T
+    residual = np.linalg.norm(coords - ideal, axis=1)
+    points["lattice_i"] = ij[:, 0]
+    points["lattice_j"] = ij[:, 1]
+    points["ideal_x"] = ideal[:, 0]
+    points["ideal_y"] = ideal[:, 1]
+    points["lattice_residual_px"] = residual
+    points["lattice_residual_fraction"] = residual / min(a_ref_px, b_ref_px)
+    points["valid_anchor"] = points["lattice_residual_fraction"] <= float(max_residual_fraction)
+    points["anchor_invalid_reason"] = np.where(points["valid_anchor"], "", "low_confidence")
+    points["origin_x"] = float(origin[0])
+    points["origin_y"] = float(origin[1])
+
+    for (_roi_id, i_value, j_value), group in points.groupby(["roi_id", "lattice_i", "lattice_j"], dropna=False, sort=False):
+        if len(group) <= 1:
+            continue
+        keep_index = group["lattice_residual_px"].astype(float).idxmin()
+        duplicate_index = [idx for idx in group.index if idx != keep_index]
+        points.loc[duplicate_index, "valid_anchor"] = False
+        points.loc[duplicate_index, "anchor_invalid_reason"] = "duplicate_anchor"
+    return points[columns]
+
+
+def build_complete_cells(
+    anchor_lattice_table: pd.DataFrame,
+    *,
+    rois: list[object] | tuple[object, ...] | None = None,
+) -> pd.DataFrame:
+    """Build complete four-corner local cells from valid anchor lattice points."""
+
+    columns = [
+        "roi_id",
+        "roi_name",
+        "cell_i",
+        "cell_j",
+        "p00_id",
+        "p10_id",
+        "p01_id",
+        "p11_id",
+        "p00_x",
+        "p00_y",
+        "p10_x",
+        "p10_y",
+        "p01_x",
+        "p01_y",
+        "p11_x",
+        "p11_y",
+        "valid",
+        "invalid_reason",
+    ]
+    if anchor_lattice_table is None or anchor_lattice_table.empty:
+        return pd.DataFrame(columns=columns)
+    roi_polygons = {}
+    for roi in rois or []:
+        roi_id = str(getattr(roi, "roi_id", "global"))
+        polygon = getattr(roi, "polygon_xy_px", None)
+        if polygon is not None:
+            roi_polygons[roi_id] = MplPath(np.asarray(polygon, dtype=float))
+    rows: list[dict[str, object]] = []
+    valid_anchor = anchor_lattice_table.loc[anchor_lattice_table.get("valid_anchor", True).astype(bool)].copy()
+    for roi_id, group in anchor_lattice_table.groupby("roi_id", dropna=False, sort=False):
+        group_valid = valid_anchor.loc[valid_anchor["roi_id"].astype(str) == str(roi_id)]
+        lookup = {
+            (int(row["lattice_i"]), int(row["lattice_j"])): row
+            for _, row in group_valid.iterrows()
+        }
+        all_ij = sorted({(int(row["lattice_i"]), int(row["lattice_j"])) for _, row in group.iterrows()})
+        for i_value, j_value in all_ij:
+            corners = {
+                "p00": lookup.get((i_value, j_value)),
+                "p10": lookup.get((i_value + 1, j_value)),
+                "p01": lookup.get((i_value, j_value + 1)),
+                "p11": lookup.get((i_value + 1, j_value + 1)),
+            }
+            missing = any(value is None for value in corners.values())
+            row: dict[str, object] = {
+                "roi_id": roi_id,
+                "roi_name": group["roi_name"].iloc[0] if "roi_name" in group.columns and len(group) else roi_id,
+                "cell_i": int(i_value),
+                "cell_j": int(j_value),
+                "valid": not missing,
+                "invalid_reason": "" if not missing else "missing_corner",
+            }
+            for label, point in corners.items():
+                row[f"{label}_id"] = pd.NA if point is None else _point_identifier(point)
+                row[f"{label}_x"] = np.nan if point is None else float(point["x_px"])
+                row[f"{label}_y"] = np.nan if point is None else float(point["y_px"])
+            if row["valid"] and str(roi_id) in roi_polygons:
+                polygon_xy = np.asarray(
+                    [
+                        [row["p00_x"], row["p00_y"]],
+                        [row["p10_x"], row["p10_y"]],
+                        [row["p11_x"], row["p11_y"]],
+                        [row["p01_x"], row["p01_y"]],
+                    ],
+                    dtype=float,
+                )
+                if not bool(np.all(roi_polygons[str(roi_id)].contains_points(polygon_xy, radius=1e-9))):
+                    row["valid"] = False
+                    row["invalid_reason"] = "outside_roi"
+            rows.append(row)
+    return pd.DataFrame(rows)[columns]
+
+
+def compute_cell_geometry(cell_table: pd.DataFrame) -> pd.DataFrame:
+    table = cell_table.copy() if cell_table is not None else pd.DataFrame()
+    for column in (
+        "center_x",
+        "center_y",
+        "a_local",
+        "b_local",
+        "theta_local_deg",
+        "area_local",
+        "a_local_x",
+        "a_local_y",
+        "b_local_x",
+        "b_local_y",
+    ):
+        if column not in table.columns:
+            table[column] = np.nan
+    if table.empty:
+        return table
+    for index, row in table.iterrows():
+        if not bool(row.get("valid", False)):
+            continue
+        p00 = np.asarray([row["p00_x"], row["p00_y"]], dtype=float)
+        p10 = np.asarray([row["p10_x"], row["p10_y"]], dtype=float)
+        p01 = np.asarray([row["p01_x"], row["p01_y"]], dtype=float)
+        p11 = np.asarray([row["p11_x"], row["p11_y"]], dtype=float)
+        a_vec = 0.5 * ((p10 - p00) + (p11 - p01))
+        b_vec = 0.5 * ((p01 - p00) + (p11 - p10))
+        denominator = float(np.linalg.norm(a_vec) * np.linalg.norm(b_vec))
+        theta = np.nan if denominator <= _SINGULAR_TOLERANCE else float(np.degrees(np.arccos(np.clip(np.dot(a_vec, b_vec) / denominator, -1.0, 1.0))))
+        table.loc[index, "a_local_x"] = float(a_vec[0])
+        table.loc[index, "a_local_y"] = float(a_vec[1])
+        table.loc[index, "b_local_x"] = float(b_vec[0])
+        table.loc[index, "b_local_y"] = float(b_vec[1])
+        table.loc[index, "a_local"] = float(np.linalg.norm(a_vec))
+        table.loc[index, "b_local"] = float(np.linalg.norm(b_vec))
+        table.loc[index, "theta_local_deg"] = theta
+        table.loc[index, "area_local"] = float(abs(a_vec[0] * b_vec[1] - a_vec[1] * b_vec[0]))
+        table.loc[index, "center_x"] = float(np.mean([p00[0], p10[0], p01[0], p11[0]]))
+        table.loc[index, "center_y"] = float(np.mean([p00[1], p10[1], p01[1], p11[1]]))
+    return table
+
+
+def compute_cell_strain(
+    cell_table: pd.DataFrame,
+    *,
+    reference_table: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    table = compute_cell_geometry(cell_table)
+    for column in ("a_ref", "b_ref", "theta_ref_deg", "area_ref", "eps_a", "eps_b", "eps_mean", "eps_area"):
+        if column not in table.columns:
+            table[column] = np.nan
+    rows: list[dict[str, object]] = []
+    for roi_id, group in table.groupby("roi_id", dropna=False, sort=False):
+        valid = group.loc[group.get("valid", False).astype(bool)].copy()
+        if reference_table is not None and not reference_table.empty:
+            ref_row = reference_table.loc[reference_table["roi_id"].astype(str) == str(roi_id)]
+        else:
+            ref_row = pd.DataFrame()
+        if not ref_row.empty:
+            a_ref = float(ref_row.iloc[0]["a_ref"])
+            b_ref = float(ref_row.iloc[0]["b_ref"])
+            theta_ref = float(ref_row.iloc[0]["theta_ref_deg"])
+            area_ref = float(ref_row.iloc[0]["area_ref"])
+            source = str(ref_row.iloc[0].get("reference_source", "manual"))
+        elif not valid.empty:
+            a_ref = float(valid["a_local"].median())
+            b_ref = float(valid["b_local"].median())
+            theta_ref = float(valid["theta_local_deg"].median())
+            area_ref = float(valid["area_local"].median())
+            source = "roi_valid_cell_median"
+        else:
+            a_ref = b_ref = theta_ref = area_ref = np.nan
+            source = "missing_valid_cells"
+        roi_mask = table["roi_id"].astype(str) == str(roi_id)
+        table.loc[roi_mask, "a_ref"] = a_ref
+        table.loc[roi_mask, "b_ref"] = b_ref
+        table.loc[roi_mask, "theta_ref_deg"] = theta_ref
+        table.loc[roi_mask, "area_ref"] = area_ref
+        valid_mask = roi_mask & table.get("valid", False).astype(bool)
+        if np.isfinite(a_ref) and a_ref != 0:
+            table.loc[valid_mask, "eps_a"] = (table.loc[valid_mask, "a_local"] - a_ref) / a_ref
+        if np.isfinite(b_ref) and b_ref != 0:
+            table.loc[valid_mask, "eps_b"] = (table.loc[valid_mask, "b_local"] - b_ref) / b_ref
+        table.loc[valid_mask, "eps_mean"] = 0.5 * (table.loc[valid_mask, "eps_a"] + table.loc[valid_mask, "eps_b"])
+        if np.isfinite(area_ref) and area_ref != 0:
+            table.loc[valid_mask, "eps_area"] = (table.loc[valid_mask, "area_local"] - area_ref) / area_ref
+        rows.append(
+            {
+                "roi_id": roi_id,
+                "a_ref": a_ref,
+                "b_ref": b_ref,
+                "theta_ref_deg": theta_ref,
+                "area_ref": area_ref,
+                "reference_source": source,
+                "n_valid_cells": int(len(valid)),
+            }
+        )
+    return table, pd.DataFrame(rows)

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
+import zipfile
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 
@@ -67,6 +69,7 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
     assert "launch_refinement_napari_viewer" in joined
     assert "run_atom_column_classification" in joined
     assert "run_generic_curation" in joined
+    assert "export_final_atom_table_excel" in joined
     assert "AtomColumnClassificationConfig" in joined
     assert "FEATURES_ENABLED" in joined
     assert "FEATURE_CHANNEL_WEIGHTS" in joined
@@ -103,6 +106,8 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
         "curate-stage",
         "checkpoint-parameters",
         "checkpoint-stage",
+        "final-excel-export-md",
+        "final-excel-export-stage",
     ]
     assert [cell_ids.index(cell_id) for cell_id in expected_order] == sorted(
         cell_ids.index(cell_id) for cell_id in expected_order
@@ -173,6 +178,9 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
     assert "nn_context_mode=NN_CONTEXT_MODE" in source_by_id["refine-stage"]
     assert "CURATION_CONFIG" in source_by_id["curate-parameters"]
     assert "SAVE_FINAL_CHECKPOINT" in source_by_id["checkpoint-parameters"]
+    assert "EXPORT_FINAL_EXCEL" in source_by_id["final-excel-export-stage"]
+    assert "FINAL_EXCEL_FILENAME" in source_by_id["final-excel-export-stage"]
+    assert "export_final_atom_table_excel" in source_by_id["final-excel-export-stage"]
 
     assert "OPEN_CLASS_REVIEW_VIEWER" not in source_by_id["classify-parameters"]
     assert "OPEN_DETECTION_OVERVIEW_VIEWER" not in joined
@@ -184,6 +192,35 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
         assert cell.get("id")
         if cell.get("cell_type") == "code":
             ast.parse(_cell_source(cell), filename=f"01_Findatom.ipynb:{cell['id']}")
+
+
+def test_export_final_atom_table_excel_writes_xlsx(tmp_path: Path) -> None:
+    from em_atom_workbench.notebook_workflows import export_final_atom_table_excel
+    from em_atom_workbench.session import AnalysisSession, PixelCalibration
+
+    session = AnalysisSession(name="excel_smoke", pixel_calibration=PixelCalibration(size=0.02, unit="nm"))
+    session.curated_points = pd.DataFrame(
+        {
+            "atom_id": [0, 1],
+            "x_px": [10.0, 20.0],
+            "y_px": [5.0, 15.0],
+            "class_id": [0, 1],
+            "class_name": ["class_0", "class_1"],
+            "fit_residual": [0.1, 0.2],
+            "quality_score": [0.9, 0.8],
+            "keep": [True, False],
+        }
+    )
+
+    result = export_final_atom_table_excel(session, result_root=tmp_path)
+    output_path = tmp_path / "01_findatom" / "tables" / "01_final_atom_columns.xlsx"
+
+    assert output_path.exists()
+    assert any("Final atom Excel exported" in message for message in result.messages)
+    with zipfile.ZipFile(output_path) as archive:
+        names = set(archive.namelist())
+    assert "xl/workbook.xml" in names
+    assert "xl/worksheets/sheet1.xml" in names
 
 
 def test_notebook_00_splits_mode_and_path_configuration_with_chinese_notes() -> None:

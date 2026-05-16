@@ -9,8 +9,12 @@ from em_atom_workbench import (
     LocalAffineStrainConfig,
     ReferenceLattice,
     ReferenceLatticeConfig,
+    assign_lattice_indices,
+    build_complete_cells,
     build_reference_lattice,
+    compute_cell_strain,
     compute_local_affine_strain,
+    resolve_anchor_period_references,
 )
 
 
@@ -176,3 +180,47 @@ def test_compute_local_affine_strain_requires_reference_lattice() -> None:
 
     with pytest.raises(ValueError, match="build_reference_lattice"):
         compute_local_affine_strain(session, LocalAffineStrainConfig())
+
+
+def test_anchor_period_reference_requires_same_class_summary() -> None:
+    summary = pd.DataFrame(
+        {
+            "roi_id": ["roi_0", "roi_0"],
+            "direction": ["a", "b"],
+            "class_selection": ["class_id:1", "class_id:1"],
+            "length_median_px": [10.0, 12.0],
+        }
+    )
+
+    resolved = resolve_anchor_period_references(summary, {"roi_0": 0})
+
+    assert bool(resolved.iloc[0]["valid"]) is False
+    assert resolved.iloc[0]["invalid_reason"] == "missing_anchor_period_reference"
+
+
+def test_complete_cell_geometry_uses_cross_product_area() -> None:
+    anchors = pd.DataFrame(
+        {
+            "point_id": ["p00", "p10", "p01", "p11"],
+            "roi_id": ["global"] * 4,
+            "roi_name": ["global"] * 4,
+            "x_px": [0.0, 10.0, 2.0, 12.0],
+            "y_px": [0.0, 0.0, 8.0, 8.0],
+        }
+    )
+
+    indexed = assign_lattice_indices(
+        anchors,
+        a_ref_px=10.0,
+        b_ref_px=np.hypot(2.0, 8.0),
+        unit_a=(1.0, 0.0),
+        unit_b=(2.0, 8.0),
+        origin_point_id="p00",
+        max_residual_fraction=0.1,
+    )
+    cells = build_complete_cells(indexed)
+    strained, references = compute_cell_strain(cells)
+
+    valid = strained.loc[strained["valid"].astype(bool)].iloc[0]
+    assert valid["area_local"] == pytest.approx(80.0)
+    assert references.iloc[0]["area_ref"] == pytest.approx(80.0)
