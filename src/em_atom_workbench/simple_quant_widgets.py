@@ -149,6 +149,7 @@ def pick_rois_with_napari(
     image_channel: str | None = None,
     image_key: str = "raw",
     default_roi_prefix: str = "ROI",
+    start_index: int = 1,
 ) -> list[AnalysisROI]:
     try:
         import napari
@@ -185,21 +186,84 @@ def pick_rois_with_napari(
     palette = plt.get_cmap("tab10")
     rois: list[AnalysisROI] = []
     for index, shape in enumerate(shapes.data):
+        display_index = int(start_index) + int(index)
         data = np.asarray(shape, dtype=float)
         if data.ndim != 2 or data.shape[0] < 3:
             continue
         polygon_xy = tuple((float(row[1] + origin_x), float(row[0] + origin_y)) for row in data)
-        roi_id = f"roi_{index}"
+        roi_id = f"roi_{display_index}"
         rois.append(
             AnalysisROI(
                 roi_id=roi_id,
-                roi_name=f"{default_roi_prefix}_{index}",
+                roi_name=f"{default_roi_prefix}_{display_index}",
                 polygon_xy_px=polygon_xy,
                 color=mcolors.to_hex(palette(index % palette.N)),
             )
         )
     if not rois:
         return [AnalysisROI(roi_id="global", roi_name="global", polygon_xy_px=None, color="#ff9f1c")]
+    return rois
+
+
+def pick_rois_on_image_with_napari(
+    image: np.ndarray,
+    points: pd.DataFrame | None = None,
+    *,
+    default_roi_prefix: str = "ROI",
+    start_index: int = 1,
+    title: str = "ROI picker",
+    point_size: float = 5.0,
+) -> list[AnalysisROI]:
+    """Pick polygon ROIs on an already-cropped image using local image coordinates."""
+
+    try:
+        import napari
+    except ImportError as exc:
+        raise ImportError("napari is required for interactive ROI picking.") from exc
+
+    points = points.copy() if points is not None else pd.DataFrame()
+    viewer = napari.Viewer(title=title)
+    viewer.add_image(image, name="image", colormap="gray")
+    if not points.empty and {"x_px", "y_px"}.issubset(points.columns):
+        points_layer = viewer.add_points(
+            _points_to_layer_data(points, (0.0, 0.0)),
+            name="analysis_points",
+            features=_features(points),
+            size=point_size,
+            face_color=_point_colors(points),
+            border_color="black",
+            border_width=0.15,
+            opacity=0.85,
+        )
+        points_layer.editable = False
+    shapes = viewer.add_shapes(
+        name="analysis_rois",
+        shape_type="polygon",
+        edge_color="#ff9f1c",
+        face_color=[1.0, 0.62, 0.11, 0.12],
+        edge_width=2,
+    )
+    shapes.editable = True
+
+    if hasattr(viewer, "show"):
+        viewer.show(block=True)
+
+    palette = plt.get_cmap("tab10")
+    rois: list[AnalysisROI] = []
+    for index, shape in enumerate(shapes.data):
+        display_index = int(start_index) + int(index)
+        data = np.asarray(shape, dtype=float)
+        if data.ndim != 2 or data.shape[0] < 3:
+            continue
+        polygon_xy = tuple((float(row[1]), float(row[0])) for row in data)
+        rois.append(
+            AnalysisROI(
+                roi_id=f"roi_{display_index}",
+                roi_name=f"{default_roi_prefix}_{display_index}",
+                polygon_xy_px=polygon_xy,
+                color=mcolors.to_hex(palette(index % palette.N)),
+            )
+        )
     return rois
 
 

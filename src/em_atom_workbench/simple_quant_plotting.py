@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import warnings
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -8,9 +9,21 @@ from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.patches import FancyArrowPatch, Polygon, Rectangle
 import numpy as np
 import pandas as pd
+from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree
 
 from .styles import FigureStyleConfig, apply_publication_style, coerce_figure_style
+
+
+DEFAULT_PERIOD_HIST_TITLE_TEMPLATE = "{roi_display_label} {direction} {metric_short}"
+
+POLYGON_VALUE_LABELS = {
+    "eps_a": "strain_a",
+    "eps_b": "strain_b",
+    "eps_mean": "strain_mean",
+    "eps_area": "area_strain",
+    "area_local": "area_local",
+}
 
 
 def _prepare_axes(ax=None, figsize: tuple[float, float] = (5.5, 5.5)):
@@ -19,6 +32,54 @@ def _prepare_axes(ax=None, figsize: tuple[float, float] = (5.5, 5.5)):
         return ax.figure, ax
     fig, ax = plt.subplots(figsize=figsize)
     return fig, ax
+
+
+def _fill_mask_nearest(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values)
+    if not np.issubdtype(arr.dtype, np.number):
+        return arr
+    fill_mask = np.asarray(mask, dtype=bool) | ~np.isfinite(arr)
+    if not fill_mask.any():
+        return arr
+    filled = arr.astype(float, copy=True)
+    if fill_mask.all():
+        filled[fill_mask] = 0.0
+        return filled
+    nearest = distance_transform_edt(fill_mask, return_distances=False, return_indices=True)
+    filled[fill_mask] = filled[tuple(index[fill_mask] for index in nearest)]
+    return filled
+
+
+def _fill_nonfinite_nearest(values: np.ndarray) -> np.ndarray:
+    return _fill_mask_nearest(values, ~np.isfinite(np.asarray(values)))
+
+
+def _display_image_array(image: np.ndarray | None) -> np.ndarray | None:
+    if image is None:
+        return None
+    if np.ma.isMaskedArray(image):
+        arr = np.ma.filled(image, np.nan)
+    else:
+        arr = np.asarray(image)
+    if not np.issubdtype(arr.dtype, np.number):
+        return arr
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        rgba = arr.astype(float, copy=True)
+        alpha = rgba[..., 3]
+        finite_alpha = np.isfinite(alpha)
+        alpha_max = float(np.nanmax(alpha[finite_alpha])) if finite_alpha.any() else 1.0
+        alpha_fill = 255.0 if alpha_max > 1.5 else 1.0
+        alpha_threshold = 0.5 if alpha_max > 1.5 else 1e-6
+        transparent = (~finite_alpha) | (alpha <= alpha_threshold)
+        if transparent.any() and not transparent.all():
+            for channel in range(3):
+                rgba[..., channel] = _fill_mask_nearest(rgba[..., channel], transparent)
+            rgba[..., 3] = np.where(transparent, alpha_fill, alpha)
+        arr = rgba
+    if arr.ndim <= 2:
+        return _fill_nonfinite_nearest(arr)
+    channels = [_fill_nonfinite_nearest(arr[..., channel]) for channel in range(arr.shape[-1])]
+    return np.stack(channels, axis=-1)
 
 
 def create_overlay_figure_with_side_panel(
@@ -47,9 +108,10 @@ def _show_image(
     axis_label_mode: str = "none",
 ) -> None:
     if image is not None:
-        ax.imshow(image, cmap="gray", origin="upper")
-        ax.set_xlim(0, image.shape[1])
-        ax.set_ylim(image.shape[0], 0)
+        display_image = _display_image_array(image)
+        ax.imshow(display_image, cmap="gray", origin="upper")
+        ax.set_xlim(0, display_image.shape[1])
+        ax.set_ylim(display_image.shape[0], 0)
     ax.set_aspect("equal")
     if show_axes:
         if axis_label_mode == "pixel":
@@ -65,6 +127,75 @@ def _show_image(
         ax.set_ylabel("")
         for spine in ax.spines.values():
             spine.set_visible(False)
+
+
+def _nice_scalebar_length_nm(span_nm: float) -> float:
+    if not np.isfinite(span_nm) or span_nm <= 0.0:
+        return 1.0
+    raw = span_nm * 0.20
+    exponent = np.floor(np.log10(raw))
+    base = raw / (10.0 ** exponent)
+    for candidate in (1.0, 2.0, 5.0, 10.0):
+        if base <= candidate:
+            return float(candidate * (10.0 ** exponent))
+    return float(10.0 ** (exponent + 1.0))
+
+
+def add_nm_scalebar(
+    ax,
+    *,
+    pixel_to_nm: float | None,
+    length_nm: float | None = None,
+    location: str = "lower right",
+    color: str = "white",
+    linewidth: float = 2.5,
+    text_pad_px: float = 4.0,
+    margin_fraction: float = 0.06,
+):
+    """Draw a true nm scalebar on image axes."""
+
+    scale = _valid_pixel_to_nm(pixel_to_nm)
+    if scale is None:
+        raise ValueError("A positive pixel_to_nm calibration is required to draw a nm scalebar.")
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    x_min, x_max = min(float(x0), float(x1)), max(float(x0), float(x1))
+    y_min, y_max = min(float(y0), float(y1)), max(float(y0), float(y1))
+    width_px = x_max - x_min
+    height_px = y_max - y_min
+    if length_nm is None:
+        length_nm = _nice_scalebar_length_nm(width_px * scale)
+    length_px = float(length_nm) / scale
+    margin_x = width_px * float(margin_fraction)
+    margin_y = height_px * float(margin_fraction)
+    loc = str(location).lower()
+    if "right" in loc:
+        x_start = x_max - margin_x - length_px
+        x_end = x_max - margin_x
+    else:
+        x_start = x_min + margin_x
+        x_end = x_start + length_px
+    if "upper" in loc:
+        y_line = y_min + margin_y
+        text_va = "bottom"
+        y_text = y_line + abs(float(text_pad_px))
+    else:
+        y_line = y_max - margin_y
+        text_va = "top"
+        y_text = y_line - abs(float(text_pad_px))
+    line = ax.plot([x_start, x_end], [y_line, y_line], color=color, linewidth=linewidth, solid_capstyle="butt", zorder=20)[0]
+    text = ax.text(
+        (x_start + x_end) / 2.0,
+        y_text,
+        f"{float(length_nm):g} nm",
+        color=color,
+        ha="center",
+        va=text_va,
+        fontsize=8,
+        zorder=21,
+        path_effects=None,
+    )
+    return line, text
 
 
 def _finite_xy(table: pd.DataFrame, x_column: str, y_column: str) -> pd.DataFrame:
@@ -597,16 +728,19 @@ def plot_basis_glyph(
     anchor: str | tuple[float, float] = "outside",
     side_ax=None,
     names: tuple[str, ...] = ("a", "b"),
+    display_unit: str = "px",
+    pixel_to_nm: float | None = None,
 ):
     if basis_vector_table is None or basis_vector_table.empty:
         return None
     if anchor == "outside" and side_ax is not None:
         _draw_side_header(side_ax, "Basis")
         for _, row in basis_vector_table.iterrows():
-            length = row.get("length_px", np.nan)
-            period = row.get("period_px", np.nan)
             angle = row.get("angle_deg", np.nan)
-            line = f"{row.get('basis_name', '')}: L={float(length):.2f}px  P={float(period):.2f}px  angle={float(angle):.1f}deg"
+            length_text = _format_basis_distance(row.get("length_px", np.nan), display_unit=display_unit, pixel_to_nm=pixel_to_nm)
+            period_text = _format_basis_distance(row.get("period_px", np.nan), display_unit=display_unit, pixel_to_nm=pixel_to_nm)
+            distance_part = f": L={length_text}  P={period_text}" if length_text and period_text else ":"
+            line = f"{row.get('basis_name', '')}{distance_part}  angle={float(angle):.1f}deg"
             y = _next_side_y(side_ax, 0.045)
             side_ax.text(0.0, y, line, transform=side_ax.transAxes, fontsize=7.5, va="top")
         return side_ax
@@ -643,6 +777,29 @@ def _finite_value(value: Any) -> bool:
         return False
 
 
+def _valid_pixel_to_nm(pixel_to_nm: float | None) -> float | None:
+    try:
+        value = float(pixel_to_nm)
+    except Exception:
+        return None
+    if np.isfinite(value) and value > 0.0:
+        return value
+    return None
+
+
+def _format_basis_distance(value_px: Any, *, display_unit: str = "px", pixel_to_nm: float | None = None) -> str | None:
+    if not _finite_value(value_px):
+        return None
+    value_px = float(value_px)
+    unit_key = str(display_unit or "px").strip().lower()
+    if unit_key in {"a", "å", "angstrom", "angstroms"}:
+        scale = _valid_pixel_to_nm(pixel_to_nm)
+        if scale is None:
+            return None
+        return f"{value_px * scale * 10.0:.2f}Å"
+    return f"{value_px:.2f}px"
+
+
 def plot_basis_vectors_on_image(
     ax,
     basis_vector_table: pd.DataFrame,
@@ -653,6 +810,8 @@ def plot_basis_vectors_on_image(
     color: str = "#f18f01",
     label_mode: str = "outside",
     zorder: int = 6,
+    display_unit: str = "px",
+    pixel_to_nm: float | None = None,
 ):
     if basis_vector_table is None or basis_vector_table.empty:
         return []
@@ -691,7 +850,10 @@ def plot_basis_vectors_on_image(
             continue
         label = str(row.get("basis_name", "basis"))
         if show_period:
-            label += f"  L={float(row.get('length_px', np.nan)):.2f}px  P={float(row.get('period_px', np.nan)):.2f}px"
+            length_text = _format_basis_distance(row.get("length_px", np.nan), display_unit=display_unit, pixel_to_nm=pixel_to_nm)
+            period_text = _format_basis_distance(row.get("period_px", np.nan), display_unit=display_unit, pixel_to_nm=pixel_to_nm)
+            if length_text and period_text:
+                label += f"  L={length_text}  P={period_text}"
         if label_mode == "near_arrow":
             x_label = x2 + 0.01 * x_span
             y_label = y2 - 0.01 * y_span
@@ -955,6 +1117,8 @@ def plot_measurement_segments_on_image(
     roi_alpha: float = 0.95,
     show_basis_vectors: bool = True,
     basis_label_mode: str = "outside",
+    basis_display_unit: str = "px",
+    pixel_to_nm: float | None = None,
     color_by: str = "task",
     fixed_color: str = "#ff9f1c",
     value_column: str = "distance_pm",
@@ -1013,8 +1177,20 @@ def plot_measurement_segments_on_image(
         image_ax.add_collection(LineCollection(guide_lines, colors="#f18f01", linewidths=1.2, alpha=0.55, zorder=2))
     if basis_vector_table is not None:
         if show_basis_vectors:
-            plot_basis_vectors_on_image(image_ax, basis_vector_table, label_mode=basis_label_mode)
-        plot_basis_glyph(image_ax, basis_vector_table, side_ax=side_ax)
+            plot_basis_vectors_on_image(
+                image_ax,
+                basis_vector_table,
+                label_mode=basis_label_mode,
+                display_unit=basis_display_unit,
+                pixel_to_nm=pixel_to_nm,
+            )
+        plot_basis_glyph(
+            image_ax,
+            basis_vector_table,
+            side_ax=side_ax,
+            display_unit=basis_display_unit,
+            pixel_to_nm=pixel_to_nm,
+        )
     if side_ax is not None:
         draw_class_legend(side_ax, class_color_map)
         draw_roi_legend(side_ax, points)
@@ -1216,6 +1392,236 @@ def _gaussian_curve(x_values: np.ndarray, mean: float, std: float, count: int, b
     return coefficient * np.exp(-0.5 * ((x_values - mean) / std) ** 2)
 
 
+def _histogram_safe_stem(values: tuple[Any, ...]) -> str:
+    return "_".join(str(value).replace(":", "_").replace("+", "_").replace(" ", "_") for value in values)
+
+
+def _prepare_gaussian_histogram_data(table: pd.DataFrame, value_column: str) -> pd.DataFrame:
+    data = table.copy() if table is not None else pd.DataFrame()
+    if data.empty or value_column not in data.columns:
+        return pd.DataFrame()
+    if "valid" in data.columns:
+        data = data.loc[data["valid"].astype(bool)].copy()
+    data[value_column] = pd.to_numeric(data[value_column], errors="coerce")
+    return data.loc[data[value_column].notna()].copy()
+
+
+def _first_non_empty_group_value(group: pd.DataFrame, column: str, default: Any = "") -> Any:
+    if column not in group.columns:
+        return default
+    values = group[column].dropna().to_numpy()
+    for value in values:
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "<na>", "none"}:
+            return value
+    return default
+
+
+def _roi_display_index(value: Any) -> str:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return ""
+    suffix = text.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return str(int(suffix))
+    return text
+
+
+def _roi_display_label(roi_id: Any, roi_name: Any) -> str:
+    index = _roi_display_index(roi_id)
+    if index and index != str(roi_id):
+        return f"ROI_{index}"
+    name = str(roi_name).strip() if roi_name is not None else ""
+    if name and name.lower() not in {"nan", "<na>", "none"}:
+        return name
+    return str(roi_id).strip() if roi_id is not None else ""
+
+
+def _metric_short(metric: str) -> str:
+    if str(metric) == "length":
+        return "Length"
+    if str(metric) == "angle":
+        return "angle"
+    return str(metric)
+
+
+def _metric_unit(value_column: str, metric: str) -> str:
+    if value_column.endswith("_A"):
+        return "Å"
+    if str(metric) == "angle":
+        return "degree"
+    if value_column.endswith("_px"):
+        return "px"
+    return ""
+
+
+def _histogram_group_metadata(
+    *,
+    keys: tuple[Any, ...],
+    group: pd.DataFrame,
+    group_columns: tuple[str, ...],
+    figure_key: str,
+    value_column: str,
+    metric: str,
+    metric_label: str,
+) -> dict[str, Any]:
+    metadata = {column: value for column, value in zip(group_columns, keys)}
+    roi_id = metadata.get("roi_id", "")
+    metadata.setdefault("direction", "")
+    metadata.setdefault("class_selection", "")
+    metadata["roi_name"] = _first_non_empty_group_value(group, "roi_name", default=roi_id)
+    metadata["roi_display_index"] = _roi_display_index(roi_id)
+    metadata["roi_display_label"] = _roi_display_label(roi_id, metadata["roi_name"])
+    metadata["figure_key"] = figure_key
+    metadata["value_column"] = value_column
+    metadata["metric"] = metric
+    metadata["metric_label"] = metric_label
+    metadata["metric_short"] = _metric_short(metric)
+    metadata["metric_unit"] = _metric_unit(value_column, metric)
+    return metadata
+
+
+def _resolve_histogram_title(
+    metadata: dict[str, Any],
+    *,
+    title_template: str | None,
+    title_overrides: dict[Any, str] | None,
+) -> str:
+    overrides = title_overrides or {}
+    override_key = (
+        str(metadata.get("roi_id", "")),
+        str(metadata.get("direction", "")),
+        str(metadata.get("class_selection", "")),
+        str(metadata.get("metric", "")),
+    )
+    if override_key in overrides:
+        return str(overrides[override_key])
+    figure_key = str(metadata.get("figure_key", ""))
+    if figure_key in overrides:
+        return str(overrides[figure_key])
+
+    template = title_template or DEFAULT_PERIOD_HIST_TITLE_TEMPLATE
+    try:
+        return str(template).format(**metadata)
+    except Exception:
+        return DEFAULT_PERIOD_HIST_TITLE_TEMPLATE.format(**metadata)
+
+
+def _gaussian_histogram_title_rows(
+    table: pd.DataFrame,
+    value_column: str,
+    *,
+    group_columns: tuple[str, ...],
+    title_prefix: str,
+    metric: str,
+    metric_label: str,
+    title_template: str | None,
+    title_overrides: dict[Any, str] | None,
+) -> list[dict[str, Any]]:
+    data = _prepare_gaussian_histogram_data(table, value_column)
+    rows: list[dict[str, Any]] = []
+    if data.empty:
+        return rows
+    for keys, group in data.groupby(list(group_columns), dropna=False, sort=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        values = group[value_column].dropna().to_numpy(dtype=float)
+        if values.size == 0:
+            continue
+        figure_key = f"{title_prefix}_{_histogram_safe_stem(keys)}_{value_column}"
+        metadata = _histogram_group_metadata(
+            keys=keys,
+            group=group,
+            group_columns=group_columns,
+            figure_key=figure_key,
+            value_column=value_column,
+            metric=metric,
+            metric_label=metric_label,
+        )
+        rows.append(
+            {
+                "figure_key": figure_key,
+                "roi_id": metadata.get("roi_id", ""),
+                "roi_name": metadata.get("roi_name", ""),
+                "roi_display_index": metadata.get("roi_display_index", ""),
+                "roi_display_label": metadata.get("roi_display_label", ""),
+                "direction": metadata.get("direction", ""),
+                "class_selection": metadata.get("class_selection", ""),
+                "metric": metric,
+                "resolved_title": _resolve_histogram_title(
+                    metadata,
+                    title_template=title_template,
+                    title_overrides=title_overrides,
+                ),
+            }
+        )
+    return rows
+
+
+def build_period_histogram_title_table(
+    period_segment_table: pd.DataFrame,
+    *,
+    title_template: str | None = DEFAULT_PERIOD_HIST_TITLE_TEMPLATE,
+    title_overrides: dict[Any, str] | None = None,
+) -> pd.DataFrame:
+    """Return the exact resolved Task 1A histogram titles before plotting."""
+
+    columns = [
+        "figure_key",
+        "roi_id",
+        "roi_name",
+        "roi_display_index",
+        "roi_display_label",
+        "direction",
+        "class_selection",
+        "metric",
+        "resolved_title",
+    ]
+    if period_segment_table is None or period_segment_table.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, Any]] = []
+    length_column = "length_A"
+    if length_column in period_segment_table.columns and period_segment_table[length_column].notna().any():
+        rows.extend(
+            _gaussian_histogram_title_rows(
+                period_segment_table,
+                length_column,
+                group_columns=("roi_id", "direction", "class_selection"),
+                title_prefix="task1A_period_length",
+                metric="length",
+                metric_label="Period length",
+                title_template=title_template,
+                title_overrides=title_overrides,
+            )
+        )
+    if "angle_delta_deg" in period_segment_table.columns:
+        rows.extend(
+            _gaussian_histogram_title_rows(
+                period_segment_table,
+                "angle_delta_deg",
+                group_columns=("roi_id", "direction", "class_selection"),
+                title_prefix="task1A_angle_delta",
+                metric="angle",
+                metric_label="Angle deviation",
+                title_template=title_template,
+                title_overrides=title_overrides,
+            )
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _format_histogram_stat(value: Any, unit: str) -> str:
+    try:
+        number = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(number):
+        return "nan"
+    suffix = f" {unit}" if unit else ""
+    return f"{number:.3g}{suffix}"
+
+
 def _plot_gaussian_histogram(
     table: pd.DataFrame,
     value_column: str,
@@ -1223,6 +1629,10 @@ def _plot_gaussian_histogram(
     group_columns: tuple[str, ...],
     xlabel: str,
     title_prefix: str,
+    metric: str,
+    metric_label: str,
+    title_template: str | None = DEFAULT_PERIOD_HIST_TITLE_TEMPLATE,
+    title_overrides: dict[Any, str] | None = None,
     bins: int = 24,
     style: FigureStyleConfig | dict | None = None,
 ) -> dict[str, Any]:
@@ -1231,13 +1641,7 @@ def _plot_gaussian_histogram(
     config = coerce_figure_style(style)
     apply_publication_style(config)
     figures: dict[str, Any] = {}
-    data = table.copy() if table is not None else pd.DataFrame()
-    if data.empty or value_column not in data.columns:
-        return figures
-    if "valid" in data.columns:
-        data = data.loc[data["valid"].astype(bool)].copy()
-    data[value_column] = pd.to_numeric(data[value_column], errors="coerce")
-    data = data.loc[data[value_column].notna()]
+    data = _prepare_gaussian_histogram_data(table, value_column)
     if data.empty:
         return figures
     for keys, group in data.groupby(list(group_columns), dropna=False, sort=False):
@@ -1261,19 +1665,37 @@ def _plot_gaussian_histogram(
             fit_y = _gaussian_curve(x_values, float(stats["mean"]), float(stats["std"]), int(stats["n"]), float(np.mean(np.diff(edges))))
             ax.plot(x_values, fit_y, color=config.fit_color, linewidth=config.line_width + 0.5, label="Gaussian fit")
         median = stats["median"]
-        robust = stats["robust_std"]
+        mean = stats["mean"]
+        std = stats["std"]
         if np.isfinite(median):
             ax.axvline(float(median), color="#2ca25f", linewidth=config.line_width, linestyle="--", label="median")
-        annotation = f"median = {median:.3g}\nrobust std = {robust:.3g}" if np.isfinite(robust) else f"median = {median:.3g}"
+        stem = _histogram_safe_stem(keys)
+        figure_key = f"{title_prefix}_{stem}_{value_column}"
+        metadata = _histogram_group_metadata(
+            keys=keys,
+            group=group,
+            group_columns=group_columns,
+            figure_key=figure_key,
+            value_column=value_column,
+            metric=metric,
+            metric_label=metric_label,
+        )
+        unit = str(metadata.get("metric_unit", ""))
+        annotation = "\n".join(
+            [
+                f"median = {_format_histogram_stat(median, unit)}",
+                f"mean = {_format_histogram_stat(mean, unit)}",
+                f"std = {_format_histogram_stat(std, unit)}",
+            ]
+        )
         ax.text(0.98, 0.95, annotation, transform=ax.transAxes, ha="right", va="top", fontsize=config.legend_size)
         ax.set_xlabel(xlabel)
         ax.set_ylabel("Counts")
-        ax.set_title(title_prefix)
+        ax.set_title(_resolve_histogram_title(metadata, title_template=title_template, title_overrides=title_overrides))
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
         ax.legend(frameon=False, loc="best")
-        stem = "_".join(str(value).replace(":", "_").replace("+", "_").replace(" ", "_") for value in keys)
-        figures[f"{title_prefix}_{stem}_{value_column}"] = fig
+        figures[figure_key] = fig
     return figures
 
 
@@ -1281,16 +1703,24 @@ def plot_period_length_histograms(
     period_segment_table: pd.DataFrame,
     *,
     bins: int = 24,
+    title_template: str | None = DEFAULT_PERIOD_HIST_TITLE_TEMPLATE,
+    title_overrides: dict[Any, str] | None = None,
     style: FigureStyleConfig | dict | None = None,
 ) -> dict[str, Any]:
-    value_column = "length_A" if period_segment_table is not None and "length_A" in period_segment_table.columns and period_segment_table["length_A"].notna().any() else "length_px"
-    xlabel = "Period length (Å)" if value_column == "length_A" else "Period length (px)"
+    if period_segment_table is None or "length_A" not in period_segment_table.columns or not period_segment_table["length_A"].notna().any():
+        return {}
+    value_column = "length_A"
+    xlabel = "Period length (Å)"
     return _plot_gaussian_histogram(
         period_segment_table,
         value_column,
         group_columns=("roi_id", "direction", "class_selection"),
         xlabel=xlabel,
         title_prefix="task1A_period_length",
+        metric="length",
+        metric_label="Period length",
+        title_template=title_template,
+        title_overrides=title_overrides,
         bins=bins,
         style=style,
     )
@@ -1300,6 +1730,8 @@ def plot_period_angle_delta_histograms(
     period_segment_table: pd.DataFrame,
     *,
     bins: int = 24,
+    title_template: str | None = DEFAULT_PERIOD_HIST_TITLE_TEMPLATE,
+    title_overrides: dict[Any, str] | None = None,
     style: FigureStyleConfig | dict | None = None,
 ) -> dict[str, Any]:
     return _plot_gaussian_histogram(
@@ -1308,6 +1740,10 @@ def plot_period_angle_delta_histograms(
         group_columns=("roi_id", "direction", "class_selection"),
         xlabel="Angle deviation (°)",
         title_prefix="task1A_angle_delta",
+        metric="angle",
+        metric_label="Angle deviation",
+        title_template=title_template,
+        title_overrides=title_overrides,
         bins=bins,
         style=style,
     )
@@ -1322,14 +1758,18 @@ def plot_projection_spacing_histogram(
     apply_publication_style(config)
     fig, ax = plt.subplots(figsize=(4.5, 3.2), constrained_layout=True)
     data = pair_line_table.copy() if pair_line_table is not None else pd.DataFrame()
-    if not data.empty and "projection_s_px" in data.columns:
+    value_column = "projection_s_A" if not data.empty and "projection_s_A" in data.columns and data["projection_s_A"].notna().any() else "projection_s_px"
+    xlabel = "Adjacent projection spacing (Å)" if value_column == "projection_s_A" else "Adjacent projection spacing (px)"
+    if value_column == "projection_s_px" and not data.empty:
+        warnings.warn("projection_s_A is unavailable; projection spacing QC falls back to px.", RuntimeWarning, stacklevel=2)
+    if not data.empty and value_column in data.columns:
         for roi_id, group in data.groupby("roi_id", dropna=False, sort=False):
-            s = pd.to_numeric(group["projection_s_px"], errors="coerce").dropna().sort_values().to_numpy(dtype=float)
+            s = pd.to_numeric(group[value_column], errors="coerce").dropna().sort_values().to_numpy(dtype=float)
             gaps = np.diff(s)
             gaps = gaps[np.isfinite(gaps) & (gaps > 1e-9)]
             if gaps.size:
                 ax.hist(gaps, bins=min(24, max(5, int(np.sqrt(gaps.size) * 2))), alpha=0.65, label=str(roi_id))
-    ax.set_xlabel("Adjacent projection spacing (px)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Counts")
     ax.set_title("Task 2 projection spacing QC")
     ax.spines["top"].set_visible(False)
@@ -1355,9 +1795,10 @@ def plot_pair_line_distance_errorbar(
         q1_column = "distance_q1_A" if value_column.endswith("_A") else "distance_q1_px"
         q3_column = "distance_q3_A" if value_column.endswith("_A") else "distance_q3_px"
         ylabel = "Pair distance (Å)" if value_column.endswith("_A") else "Pair distance (px)"
+        x_column = "global_line_id" if "global_line_id" in summary.columns and summary["global_line_id"].notna().any() else "line_id"
         for roi_id, group in summary.groupby("roi_id", dropna=False, sort=False):
-            group = group.sort_values("line_id")
-            x = pd.to_numeric(group["line_id"], errors="coerce").to_numpy(dtype=float)
+            group = group.sort_values(x_column)
+            x = pd.to_numeric(group[x_column], errors="coerce").to_numpy(dtype=float)
             y = pd.to_numeric(group[value_column], errors="coerce").to_numpy(dtype=float)
             yerr = np.vstack(
                 [
@@ -1368,10 +1809,11 @@ def plot_pair_line_distance_errorbar(
             ax.errorbar(x, y, yerr=yerr, marker="o", markersize=4, linewidth=config.line_width, capsize=3, label=str(roi_id))
         if pair_line_table is not None and not pair_line_table.empty:
             raw = pair_line_table.loc[pair_line_table.get("line_valid", False).astype(bool)].copy()
-            if not raw.empty and "line_id" in raw.columns:
+            raw_x_column = x_column if x_column in raw.columns and raw[x_column].notna().any() else "line_id"
+            if not raw.empty and raw_x_column in raw.columns:
                 raw_value = "distance_A" if "distance_A" in raw.columns and raw["distance_A"].notna().any() else "distance_px"
                 ax.scatter(
-                    pd.to_numeric(raw["line_id"], errors="coerce"),
+                    pd.to_numeric(raw[raw_x_column], errors="coerce"),
                     pd.to_numeric(raw[raw_value], errors="coerce"),
                     s=8,
                     color="0.25",
@@ -1379,7 +1821,10 @@ def plot_pair_line_distance_errorbar(
                     zorder=1,
                 )
         ax.set_ylabel(ylabel)
-    ax.set_xlabel("Line index")
+    if not summary.empty and "global_line_id" in summary.columns and summary["global_line_id"].notna().any():
+        ax.set_xlabel("Global line index")
+    else:
+        ax.set_xlabel("Line index")
     ax.set_title(title)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -1428,10 +1873,11 @@ def plot_pair_center_line_assignment(
     _show_image(ax, image)
     plot_roi_outlines_on_image(ax, rois, label_mode="none")
     data = pair_line_table.copy() if pair_line_table is not None else pd.DataFrame()
-    if not data.empty and {"center_x", "center_y", "line_id"}.issubset(data.columns):
+    color_column = "global_line_id" if "global_line_id" in data.columns and data["global_line_id"].notna().any() else "line_id"
+    if not data.empty and {"center_x", "center_y", color_column}.issubset(data.columns):
         valid = data.loc[data.get("line_valid", False).astype(bool)].copy()
         if not valid.empty:
-            labels = valid["line_id"].astype(str)
+            labels = valid[color_column].astype(str)
             color_map = _categorical_color_map(labels, "tab20")
             colors = [color_map[str(label)] for label in labels]
             ax.scatter(valid["center_x"], valid["center_y"], s=config.marker_size, c=colors, edgecolors="white", linewidths=0.25, zorder=5)
@@ -1486,15 +1932,15 @@ def plot_polygon_cell_map(
                 vmax = float(np.nanmax(np.abs(values))) if values.size else 1.0
                 collection.set_clim(-vmax, vmax)
             ax.add_collection(collection)
-            label = value_column
+            label = POLYGON_VALUE_LABELS.get(str(value_column), str(value_column))
             if str(value_column).startswith("eps_"):
-                label = f"{value_column} (%)"
+                label = f"{label} (%)"
                 collection.set_array(values * 100.0)
                 if symmetric:
                     vmax = float(np.nanmax(np.abs(values * 100.0))) if values.size else 1.0
                     collection.set_clim(-vmax, vmax)
             _add_colorbar(fig, ax, collection, label)
-    ax.set_title(title or value_column)
+    ax.set_title(title or POLYGON_VALUE_LABELS.get(str(value_column), str(value_column)))
     return fig, ax
 
 
@@ -1531,5 +1977,167 @@ def plot_group_centers_and_displacements(
             )
     if centers is not None and not centers.empty:
         ax.legend(frameon=False, loc="best")
+    ax.set_title(title)
+    return fig, ax
+
+
+def _distance_value_column(displacements: pd.DataFrame) -> tuple[str | None, str]:
+    for column, label in (
+        ("distance_nm", "Displacement (nm)"),
+        ("distance_A", "Displacement (Å)"),
+        ("distance_px", "Displacement (px)"),
+    ):
+        if column in displacements.columns and pd.to_numeric(displacements[column], errors="coerce").notna().any():
+            return column, label
+    return None, "Displacement"
+
+
+def _smooth_scalar_field(
+    image_shape: tuple[int, int],
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    *,
+    sigma_px: float | None = None,
+) -> np.ndarray | None:
+    if len(values) == 0:
+        return None
+    height, width = int(image_shape[0]), int(image_shape[1])
+    if height <= 0 or width <= 0:
+        return None
+    if sigma_px is None:
+        sigma_px = max(min(width, height) / 5.0, 8.0)
+    sigma = max(float(sigma_px), 1e-6)
+    grid_y, grid_x = np.mgrid[0:height, 0:width].astype(float)
+    numerator = np.zeros((height, width), dtype=float)
+    denominator = np.zeros((height, width), dtype=float)
+    for x_i, y_i, value in zip(x, y, values, strict=False):
+        distance2 = (grid_x - float(x_i)) ** 2 + (grid_y - float(y_i)) ** 2
+        weight = np.exp(-0.5 * distance2 / (sigma * sigma))
+        numerator += weight * float(value)
+        denominator += weight
+    field = numerator / np.maximum(denominator, 1e-12)
+    return field
+
+
+def plot_cropped_group_centers_and_displacements(
+    image: np.ndarray | None,
+    group_centroid_table: pd.DataFrame,
+    group_displacement_table: pd.DataFrame,
+    *,
+    pixel_to_nm: float | None,
+    style: FigureStyleConfig | dict | None = None,
+    title: str = "Cropped group-center displacement",
+    scalebar_length_nm: float | None = None,
+    show_centers: bool = False,
+    show_center_legend: bool = False,
+    center_size_scale: float = 2.2,
+    arrow_color: str = "black",
+    arrow_edge_color: str | None = None,
+    arrow_linewidth: float | None = None,
+    arrow_mutation_scale: float = 9.0,
+    arrow_tail_width: float = 0.55,
+    arrow_head_width: float = 3.8,
+    arrow_head_length: float = 4.5,
+    arrow_alpha: float = 0.95,
+    distance_cmap: str = "magma",
+    distance_alpha: float = 0.42,
+    interpolation_sigma_px: float | None = None,
+    show_distance_colorbar: bool = True,
+    show_scalebar: bool = False,
+    scalebar_color: str = "black",
+    scalebar_linewidth: float | None = None,
+    scalebar_location: str = "lower right",
+):
+    """Plot cropped group-pair arrows and smooth distance coloring."""
+
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    fig, ax = _prepare_axes(figsize=(5.5, 5.5))
+    _show_image(ax, image)
+    centers = group_centroid_table.copy() if group_centroid_table is not None else pd.DataFrame()
+    valid_centers = pd.DataFrame()
+    if not centers.empty:
+        valid_centers = centers.loc[centers.get("valid", False).astype(bool)].copy()
+    if show_centers and not valid_centers.empty:
+        color_map = _categorical_color_map(valid_centers["group_name"].astype(str), "tab10")
+        for group_name, group in valid_centers.groupby("group_name", sort=False):
+            ax.scatter(
+                group["center_x"],
+                group["center_y"],
+                s=config.marker_size * float(center_size_scale),
+                c=color_map[str(group_name)],
+                edgecolors="white",
+                linewidths=0.5,
+                label=str(group_name),
+                zorder=5,
+            )
+    displacements = group_displacement_table.copy() if group_displacement_table is not None else pd.DataFrame()
+    valid_displacements = pd.DataFrame()
+    if not displacements.empty:
+        valid_displacements = displacements.loc[displacements.get("valid", False).astype(bool)].copy()
+    if image is not None and not valid_displacements.empty:
+        distance_column, distance_label = _distance_value_column(valid_displacements)
+        if distance_column is not None:
+            values = pd.to_numeric(valid_displacements[distance_column], errors="coerce").to_numpy(dtype=float)
+            x_mid = (
+                pd.to_numeric(valid_displacements["center_A_x"], errors="coerce").to_numpy(dtype=float)
+                + pd.to_numeric(valid_displacements["center_B_x"], errors="coerce").to_numpy(dtype=float)
+            ) / 2.0
+            y_mid = (
+                pd.to_numeric(valid_displacements["center_A_y"], errors="coerce").to_numpy(dtype=float)
+                + pd.to_numeric(valid_displacements["center_B_y"], errors="coerce").to_numpy(dtype=float)
+            ) / 2.0
+            mask = np.isfinite(x_mid) & np.isfinite(y_mid) & np.isfinite(values)
+            if np.any(mask):
+                field = _smooth_scalar_field(
+                    image.shape[:2],
+                    x_mid[mask],
+                    y_mid[mask],
+                    values[mask],
+                    sigma_px=interpolation_sigma_px,
+                )
+                if field is not None:
+                    overlay = ax.imshow(
+                        field,
+                        cmap=distance_cmap,
+                        origin="upper",
+                        alpha=float(distance_alpha),
+                        extent=(0, image.shape[1], image.shape[0], 0),
+                        zorder=2,
+                    )
+                    if show_distance_colorbar:
+                        colorbar = fig.colorbar(overlay, ax=ax, fraction=0.035, pad=0.02)
+                        colorbar.set_label(distance_label)
+    if not valid_displacements.empty:
+        for _, row in valid_displacements.iterrows():
+            arrow = FancyArrowPatch(
+                (float(row["center_A_x"]), float(row["center_A_y"])),
+                (float(row["center_B_x"]), float(row["center_B_y"])),
+                arrowstyle=(
+                    f"Simple,tail_width={float(arrow_tail_width)},"
+                    f"head_width={float(arrow_head_width)},head_length={float(arrow_head_length)}"
+                ),
+                mutation_scale=float(arrow_mutation_scale),
+                linewidth=float(arrow_linewidth if arrow_linewidth is not None else 0.2),
+                facecolor=arrow_color,
+                edgecolor=arrow_edge_color if arrow_edge_color is not None else arrow_color,
+                alpha=float(arrow_alpha),
+                shrinkA=0.0,
+                shrinkB=0.0,
+                zorder=6,
+            )
+            ax.add_patch(arrow)
+    if show_centers and show_center_legend and not valid_centers.empty:
+        ax.legend(frameon=False, loc="best", title="Group centers")
+    if show_scalebar:
+        add_nm_scalebar(
+            ax,
+            pixel_to_nm=pixel_to_nm,
+            length_nm=scalebar_length_nm,
+            location=scalebar_location,
+            color=scalebar_color,
+            linewidth=float(scalebar_linewidth if scalebar_linewidth is not None else max(config.line_width, 1.2)),
+        )
     ax.set_title(title)
     return fig, ax

@@ -243,6 +243,20 @@ def _simple_quant_output_dirs(result_root: str | Path) -> dict[str, Path]:
     return dirs
 
 
+def cropped_group_centroid_output_dirs(result_root: str | Path) -> dict[str, Path]:
+    output_dir = Path(result_root) / "03_cropped_group_centroid"
+    dirs = {
+        "output": output_dir,
+        "tables": output_dir / "tables",
+        "figures": output_dir / "figures",
+        "configs": output_dir / "configs",
+        "session": output_dir / "session",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
 def _resolve_simple_quant_image(
     session: AnalysisSession,
     *,
@@ -1916,6 +1930,32 @@ def export_task3_excel(
     )
 
 
+def export_cropped_group_centroid_excel(
+    output_dirs: dict[str, Path],
+    *,
+    crop_table: pd.DataFrame,
+    cropped_atom_table: pd.DataFrame,
+    measurement_roi_table: pd.DataFrame,
+    group_centroid_table: pd.DataFrame,
+    group_displacement_table: pd.DataFrame,
+    group_config: pd.DataFrame,
+    summary: pd.DataFrame,
+    filename: str = "cropped_group_centroid_analysis.xlsx",
+) -> dict[str, Any]:
+    return _export_task_excel(
+        output_dirs["tables"] / filename,
+        {
+            "crop_roi": crop_table,
+            "cropped_atoms": cropped_atom_table,
+            "measurement_rois": measurement_roi_table,
+            "group_centroids": group_centroid_table,
+            "group_displacements": group_displacement_table,
+            "groups": group_config,
+            "summary": summary,
+        },
+    )
+
+
 def save_notebook02_figures(
     figures: dict[str, Any],
     figures_dir: str | Path,
@@ -1985,6 +2025,58 @@ def export_notebook02_results(
     }
     session.set_stage("simple_quant_v2")
     checkpoint_path = session.save_pickle(output_dirs["session"] / "02_simple_quant_session.pkl")
+    manifest["manifest"] = str(manifest_path)
+    manifest["session_checkpoint"] = str(checkpoint_path)
+    return manifest
+
+
+def export_notebook03_results(
+    *,
+    session: AnalysisSession,
+    output_dirs: dict[str, Path],
+    tables: dict[str, pd.DataFrame | None],
+    figures: dict[str, Any] | None = None,
+    configs: dict[str, Any] | None = None,
+    excel_exports: dict[str, Any] | None = None,
+    figure_formats: tuple[str, ...] = ("png", "pdf"),
+    figure_dpi: int = 600,
+) -> dict[str, Any]:
+    table_paths: dict[str, str] = {}
+    for name, table in (tables or {}).items():
+        if table is None:
+            continue
+        target = output_dirs["tables"] / f"{name}.csv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(target, index=False)
+        table_paths[str(name)] = str(target)
+    figure_paths = save_notebook02_figures(
+        figures or {},
+        output_dirs["figures"],
+        formats=tuple(figure_formats),
+        dpi=int(figure_dpi),
+    )
+    config_paths: dict[str, str] = {}
+    for name, payload in (configs or {}).items():
+        path = write_json(output_dirs["configs"] / f"{name}.json", payload if isinstance(payload, dict) else {"value": payload})
+        config_paths[str(name)] = str(path)
+    manifest = {
+        "workflow": "cropped_group_centroid_notebook03",
+        "output_dir": str(output_dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "configs": config_paths,
+        "excel_exports": excel_exports or {},
+    }
+    manifest_path = write_json(output_dirs["output"] / "manifest.json", manifest)
+    session.annotations["notebook03_cropped_group_centroid"] = {
+        "output_dir": str(output_dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "configs": config_paths,
+        "excel_exports": excel_exports or {},
+    }
+    session.set_stage("cropped_group_centroid")
+    checkpoint_path = session.save_pickle(output_dirs["session"] / "03_cropped_group_centroid_session.pkl")
     manifest["manifest"] = str(manifest_path)
     manifest["session_checkpoint"] = str(checkpoint_path)
     return manifest

@@ -6,6 +6,7 @@ from typing import Any
 from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
+from scipy.ndimage import map_coordinates
 from scipy.spatial import cKDTree
 
 
@@ -361,6 +362,345 @@ def points_in_roi(points: pd.DataFrame, roi: AnalysisROI) -> pd.DataFrame:
     coords = points[["x_px", "y_px"]].to_numpy(dtype=float)
     mask = path.contains_points(coords, radius=1e-9)
     return points.loc[mask].copy()
+
+
+def translate_rois_xy(
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...],
+    *,
+    dx_px: float = 0.0,
+    dy_px: float = 0.0,
+    roi_id_prefix: str | None = None,
+    roi_name_prefix: str | None = None,
+) -> list[AnalysisROI]:
+    """Return ROI copies shifted by a pixel-space x/y offset."""
+
+    shifted: list[AnalysisROI] = []
+    for roi in rois or []:
+        polygon = None
+        if roi.polygon_xy_px is not None:
+            polygon = tuple(
+                (float(x) + float(dx_px), float(y) + float(dy_px))
+                for x, y in roi.polygon_xy_px
+            )
+        roi_id = str(roi.roi_id)
+        roi_name = str(roi.roi_name or roi.roi_id)
+        if roi_id_prefix:
+            roi_id = f"{roi_id_prefix}{roi_id}"
+        if roi_name_prefix:
+            roi_name = f"{roi_name_prefix}{roi_name}"
+        shifted.append(
+            AnalysisROI(
+                roi_id=roi_id,
+                roi_name=roi_name,
+                polygon_xy_px=polygon,
+                color=roi.color,
+                class_ids=roi.class_ids,
+                class_names=roi.class_names,
+                enabled=roi.enabled,
+            )
+        )
+    return shifted
+
+
+def transform_rois_xy(
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...],
+    *,
+    origin_xy_px: tuple[float, float],
+    basis_x_px: tuple[float, float] = (1.0, 0.0),
+    basis_y_px: tuple[float, float] = (0.0, 1.0),
+    roi_id_prefix: str | None = None,
+    roi_name_prefix: str | None = None,
+) -> list[AnalysisROI]:
+    """Transform local ROI coordinates to global coordinates with an affine crop basis."""
+
+    origin = np.asarray(origin_xy_px, dtype=float)
+    basis_x = np.asarray(basis_x_px, dtype=float)
+    basis_y = np.asarray(basis_y_px, dtype=float)
+    transformed: list[AnalysisROI] = []
+    for roi in rois or []:
+        polygon = None
+        if roi.polygon_xy_px is not None:
+            local = np.asarray(roi.polygon_xy_px, dtype=float)
+            global_xy = origin[None, :] + local[:, 0:1] * basis_x[None, :] + local[:, 1:2] * basis_y[None, :]
+            polygon = tuple((float(x), float(y)) for x, y in global_xy)
+        roi_id = str(roi.roi_id)
+        roi_name = str(roi.roi_name or roi.roi_id)
+        if roi_id_prefix:
+            roi_id = f"{roi_id_prefix}{roi_id}"
+        if roi_name_prefix:
+            roi_name = f"{roi_name_prefix}{roi_name}"
+        transformed.append(
+            AnalysisROI(
+                roi_id=roi_id,
+                roi_name=roi_name,
+                polygon_xy_px=polygon,
+                color=roi.color,
+                class_ids=roi.class_ids,
+                class_names=roi.class_names,
+                enabled=roi.enabled,
+            )
+        )
+    return transformed
+
+
+def full_image_roi(
+    image: np.ndarray | None,
+    *,
+    roi_id: str = "crop_full",
+    roi_name: str = "crop_full",
+    color: str = "#ff9f1c",
+) -> AnalysisROI:
+    """Build a rectangular ROI covering an image in local pixel coordinates."""
+
+    if image is None:
+        return AnalysisROI(roi_id=roi_id, roi_name=roi_name, polygon_xy_px=None, color=color)
+    height = int(image.shape[0])
+    width = int(image.shape[1])
+    polygon = ((0.0, 0.0), (float(width), 0.0), (float(width), float(height)), (0.0, float(height)))
+    return AnalysisROI(roi_id=roi_id, roi_name=roi_name, polygon_xy_px=polygon, color=color)
+
+
+def _crop_bounds_from_roi(
+    crop_roi: AnalysisROI,
+    image_shape: tuple[int, ...] | None,
+    *,
+    margin_px: float = 0.0,
+) -> tuple[int, int, int, int, np.ndarray | None]:
+    if crop_roi.polygon_xy_px is None:
+        if image_shape is None:
+            raise ValueError("A global crop ROI requires an image so crop bounds can be inferred.")
+        return 0, int(image_shape[1]), 0, int(image_shape[0]), None
+    polygon = np.asarray(crop_roi.polygon_xy_px, dtype=float)
+    if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2:
+        raise ValueError("crop_roi polygon_xy_px must contain at least three (x, y) points.")
+    margin = max(float(margin_px), 0.0)
+    x_min = int(np.floor(np.nanmin(polygon[:, 0]) - margin))
+    x_max = int(np.ceil(np.nanmax(polygon[:, 0]) + margin))
+    y_min = int(np.floor(np.nanmin(polygon[:, 1]) - margin))
+    y_max = int(np.ceil(np.nanmax(polygon[:, 1]) + margin))
+    if image_shape is not None:
+        height, width = int(image_shape[0]), int(image_shape[1])
+        x_min = max(0, min(width, x_min))
+        x_max = max(0, min(width, x_max))
+        y_min = max(0, min(height, y_min))
+        y_max = max(0, min(height, y_max))
+    if x_max <= x_min or y_max <= y_min:
+        raise ValueError("crop_roi does not define a non-empty crop after clipping to the image.")
+    return x_min, x_max, y_min, y_max, polygon
+
+
+def _clean_polygon_vertices(polygon_xy_px: Any) -> np.ndarray | None:
+    if polygon_xy_px is None:
+        return None
+    polygon = np.asarray(polygon_xy_px, dtype=float)
+    if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2:
+        return None
+    if np.allclose(polygon[0], polygon[-1]):
+        polygon = polygon[:-1]
+    return polygon
+
+
+def _oriented_rectangle_transform(
+    polygon_xy_px: Any,
+    *,
+    margin_px: float = 0.0,
+    aspect_tolerance: float = 0.18,
+) -> dict[str, Any] | None:
+    polygon = _clean_polygon_vertices(polygon_xy_px)
+    if polygon is None or polygon.shape[0] != 4:
+        return None
+    edges = np.roll(polygon, -1, axis=0) - polygon
+    lengths = np.linalg.norm(edges, axis=1)
+    if not np.all(np.isfinite(lengths)) or np.any(lengths <= 1e-9):
+        return None
+    opposite_a = abs(lengths[0] - lengths[2]) / max(lengths[0], lengths[2])
+    opposite_b = abs(lengths[1] - lengths[3]) / max(lengths[1], lengths[3])
+    if opposite_a > aspect_tolerance or opposite_b > aspect_tolerance:
+        return None
+    long_index = int(np.argmax(lengths))
+    u = edges[long_index] / float(lengths[long_index])
+    if u[0] < 0 or (abs(u[0]) < 1e-9 and u[1] < 0):
+        u = -u
+    v = np.asarray((-u[1], u[0]), dtype=float)
+    if v[1] < 0:
+        v = -v
+    s = polygon @ u
+    t = polygon @ v
+    margin = max(float(margin_px), 0.0)
+    s_min = float(np.nanmin(s) - margin)
+    s_max = float(np.nanmax(s) + margin)
+    t_min = float(np.nanmin(t) - margin)
+    t_max = float(np.nanmax(t) + margin)
+    width = int(np.ceil(s_max - s_min))
+    height = int(np.ceil(t_max - t_min))
+    if width <= 0 or height <= 0:
+        return None
+    origin = u * s_min + v * t_min
+    local_polygon = np.column_stack((s - s_min, t - t_min))
+    return {
+        "mode": "oriented_rectangle",
+        "origin_xy_px": (float(origin[0]), float(origin[1])),
+        "basis_x_px": (float(u[0]), float(u[1])),
+        "basis_y_px": (float(v[0]), float(v[1])),
+        "width_px": float(s_max - s_min),
+        "height_px": float(t_max - t_min),
+        "width_samples": width,
+        "height_samples": height,
+        "polygon_local_xy_px": tuple((float(x), float(y)) for x, y in local_polygon),
+        "s_min": s_min,
+        "s_max": s_max,
+        "t_min": t_min,
+        "t_max": t_max,
+    }
+
+
+def _sample_oriented_crop(image: np.ndarray, transform: dict[str, Any]) -> np.ndarray:
+    height = int(transform["height_samples"])
+    width = int(transform["width_samples"])
+    origin = np.asarray(transform["origin_xy_px"], dtype=float)
+    basis_x = np.asarray(transform["basis_x_px"], dtype=float)
+    basis_y = np.asarray(transform["basis_y_px"], dtype=float)
+    grid_y, grid_x = np.mgrid[0:height, 0:width].astype(float)
+    sample_x = origin[0] + grid_x * basis_x[0] + grid_y * basis_y[0]
+    sample_y = origin[1] + grid_x * basis_x[1] + grid_y * basis_y[1]
+    if image.ndim == 2:
+        return map_coordinates(image, [sample_y, sample_x], order=1, mode="nearest")
+    channels = [
+        map_coordinates(image[..., channel], [sample_y, sample_x], order=1, mode="nearest")
+        for channel in range(image.shape[-1])
+    ]
+    return np.stack(channels, axis=-1)
+
+
+def crop_image_and_points_by_roi(
+    image: np.ndarray | None,
+    analysis_points: pd.DataFrame,
+    crop_roi: AnalysisROI,
+    *,
+    margin_px: float = 0.0,
+    crop_id: str = "crop_1",
+    crop_name: str | None = None,
+) -> dict[str, Any]:
+    """Crop an image and keep ROI-contained atoms in crop-local coordinates.
+
+    Four-corner rectangle ROIs are sampled in their own oriented coordinate frame,
+    with the long edge rotated to horizontal. Other polygon ROIs fall back to an
+    axis-aligned bounding-box crop.
+    """
+
+    if analysis_points is None:
+        analysis_points = pd.DataFrame()
+    polygon = _clean_polygon_vertices(crop_roi.polygon_xy_px)
+    oriented = _oriented_rectangle_transform(crop_roi.polygon_xy_px, margin_px=margin_px) if image is not None else None
+    if oriented is not None:
+        cropped_image = _sample_oriented_crop(image, oriented)
+        transform = oriented
+        x_min, x_max, y_min, y_max, _ = _crop_bounds_from_roi(crop_roi, tuple(image.shape), margin_px=margin_px)
+    else:
+        x_min, x_max, y_min, y_max, polygon = _crop_bounds_from_roi(
+            crop_roi,
+            None if image is None else tuple(image.shape),
+            margin_px=margin_px,
+        )
+        cropped_image = None if image is None else image[y_min:y_max, x_min:x_max, ...].copy()
+        transform = {
+            "mode": "axis_aligned_bbox",
+            "origin_xy_px": (float(x_min), float(y_min)),
+            "basis_x_px": (1.0, 0.0),
+            "basis_y_px": (0.0, 1.0),
+            "width_px": float(x_max - x_min),
+            "height_px": float(y_max - y_min),
+            "width_samples": int(x_max - x_min),
+            "height_samples": int(y_max - y_min),
+            "polygon_local_xy_px": None,
+        }
+    cropped = points_in_roi(analysis_points, crop_roi).copy()
+    pixel_to_nm = _pixel_to_nm_from_table(analysis_points)
+    origin = np.asarray(transform["origin_xy_px"], dtype=float)
+    basis_x = np.asarray(transform["basis_x_px"], dtype=float)
+    basis_y = np.asarray(transform["basis_y_px"], dtype=float)
+    if not cropped.empty:
+        cropped["global_x_px"] = pd.to_numeric(cropped["x_px"], errors="coerce")
+        cropped["global_y_px"] = pd.to_numeric(cropped["y_px"], errors="coerce")
+        if "x_nm" in cropped.columns:
+            cropped["global_x_nm"] = pd.to_numeric(cropped["x_nm"], errors="coerce")
+        if "y_nm" in cropped.columns:
+            cropped["global_y_nm"] = pd.to_numeric(cropped["y_nm"], errors="coerce")
+        delta = cropped[["global_x_px", "global_y_px"]].to_numpy(dtype=float) - origin[None, :]
+        cropped["x_px"] = delta @ basis_x
+        cropped["y_px"] = delta @ basis_y
+        if pixel_to_nm is not None:
+            cropped["x_nm"] = cropped["x_px"] * float(pixel_to_nm)
+            cropped["y_nm"] = cropped["y_px"] * float(pixel_to_nm)
+            if "global_x_nm" not in cropped.columns:
+                cropped["global_x_nm"] = cropped["global_x_px"] * float(pixel_to_nm)
+            if "global_y_nm" not in cropped.columns:
+                cropped["global_y_nm"] = cropped["global_y_px"] * float(pixel_to_nm)
+        else:
+            cropped["x_nm"] = np.nan
+            cropped["y_nm"] = np.nan
+        cropped["crop_id"] = str(crop_id)
+        cropped["crop_name"] = str(crop_name or crop_roi.roi_name or crop_roi.roi_id)
+        cropped["crop_origin_x_px"] = float(origin[0])
+        cropped["crop_origin_y_px"] = float(origin[1])
+        cropped["crop_basis_x_x"] = float(basis_x[0])
+        cropped["crop_basis_x_y"] = float(basis_x[1])
+        cropped["crop_basis_y_x"] = float(basis_y[0])
+        cropped["crop_basis_y_y"] = float(basis_y[1])
+        cropped["crop_width_px"] = float(transform["width_px"])
+        cropped["crop_height_px"] = float(transform["height_px"])
+    cropped.attrs["pixel_to_nm"] = pixel_to_nm
+    local_polygon = transform.get("polygon_local_xy_px")
+    local_crop_roi = AnalysisROI(
+        roi_id=crop_roi.roi_id,
+        roi_name=crop_roi.roi_name or crop_roi.roi_id,
+        polygon_xy_px=local_polygon,
+        color=crop_roi.color,
+        class_ids=crop_roi.class_ids,
+        class_names=crop_roi.class_names,
+        enabled=crop_roi.enabled,
+    ) if local_polygon is not None else translate_rois_xy([crop_roi], dx_px=-float(x_min), dy_px=-float(y_min))[0]
+    crop_table = pd.DataFrame(
+        [
+            {
+                "crop_id": str(crop_id),
+                "crop_name": str(crop_name or crop_roi.roi_name or crop_roi.roi_id),
+                "source_roi_id": str(crop_roi.roi_id),
+                "source_roi_name": str(crop_roi.roi_name or crop_roi.roi_id),
+                "crop_mode": transform["mode"],
+                "origin_x_px": float(origin[0]),
+                "origin_y_px": float(origin[1]),
+                "basis_x_x": float(basis_x[0]),
+                "basis_x_y": float(basis_x[1]),
+                "basis_y_x": float(basis_y[0]),
+                "basis_y_y": float(basis_y[1]),
+                "x_min_px": float(x_min),
+                "x_max_px": float(x_max),
+                "y_min_px": float(y_min),
+                "y_max_px": float(y_max),
+                "width_px": float(transform["width_px"]),
+                "height_px": float(transform["height_px"]),
+                "pixel_to_nm": pixel_to_nm,
+                "width_nm": float(transform["width_px"]) * float(pixel_to_nm) if pixel_to_nm is not None else np.nan,
+                "height_nm": float(transform["height_px"]) * float(pixel_to_nm) if pixel_to_nm is not None else np.nan,
+                "polygon_xy_px": tuple(map(tuple, polygon)) if polygon is not None else None,
+                "polygon_local_xy_px": local_crop_roi.polygon_xy_px,
+                "point_count": int(len(cropped)),
+            }
+        ]
+    )
+    return {
+        "image": cropped_image,
+        "points": cropped.reset_index(drop=True),
+        "crop_roi": crop_roi,
+        "crop_roi_local": local_crop_roi,
+        "crop_table": crop_table,
+        "origin_xy_px": (float(origin[0]), float(origin[1])),
+        "basis_x_px": (float(basis_x[0]), float(basis_x[1])),
+        "basis_y_px": (float(basis_y[0]), float(basis_y[1])),
+        "transform": transform,
+        "bounds_xy_px": (float(x_min), float(x_max), float(y_min), float(y_max)),
+    }
 
 
 def assign_points_to_rois(points: pd.DataFrame, rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | None) -> pd.DataFrame:
@@ -2374,7 +2714,17 @@ def _pixel_to_nm_from_table(table: pd.DataFrame) -> float | None:
     value = getattr(table, "attrs", {}).get("pixel_to_nm")
     if value is not None and np.isfinite(float(value)) and float(value) > 0:
         return float(value)
-    return _pixel_to_nm_from_points(table)
+    pixel_to_nm = _pixel_to_nm_from_points(table)
+    if pixel_to_nm is not None:
+        return pixel_to_nm
+    if table is not None and not table.empty and {"distance_A", "distance_px"}.issubset(table.columns):
+        distance_A = pd.to_numeric(table["distance_A"], errors="coerce")
+        distance_px = pd.to_numeric(table["distance_px"], errors="coerce")
+        ratios = distance_A / (distance_px * 10.0)
+        ratios = ratios[np.isfinite(ratios) & (ratios > 0.0)]
+        if len(ratios):
+            return float(ratios.median())
+    return None
 
 
 def _distance_A_to_px(distance_A: float | None, pixel_to_nm: float | None) -> float | None:
@@ -2506,7 +2856,10 @@ def find_strict_mutual_nearest_pairs(
                 distance_px = float(source_to_target_dist[source_index])
                 valid = max_distance_px is None or distance_px <= max_distance_px
                 rows.append(row_record(roi_id, mode, p1, p2, valid, "" if valid else "too_far"))
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    if pixel_to_nm is not None:
+        result.attrs["pixel_to_nm"] = pixel_to_nm
+    return result
 
 
 def suggest_line_tolerance_from_projection(
@@ -2557,23 +2910,59 @@ def assign_pair_center_lines_by_projection(
     projection_vector: tuple[float, float],
     line_tolerance_px: float | None = None,
     min_pairs_per_line: int = 2,
+    line_index_mode: str = "per_roi",
+    pixel_to_nm: float | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Assign valid pair centers to 1D lines along a projection axis."""
 
     if pair_table is None or pair_table.empty:
         return pd.DataFrame(), pd.DataFrame()
+    mode = str(line_index_mode).lower()
+    if mode not in {"per_roi", "global"}:
+        raise ValueError("line_index_mode must be 'per_roi' or 'global'.")
     vector = np.asarray(projection_vector, dtype=float)
     norm = float(np.linalg.norm(vector))
     if not np.isfinite(norm) or norm <= 0.0:
         raise ValueError("projection_vector must be a non-zero 2D vector.")
     unit = vector / norm
     suggestion = suggest_line_tolerance_from_projection(pair_table, tuple(vector))
+    if pixel_to_nm is None:
+        pixel_to_nm = _pixel_to_nm_from_table(pair_table)
     table = pair_table.copy()
     table["projection_s_px"] = np.nan
+    table["projection_s_A"] = np.nan
     table["line_id"] = pd.NA
+    table["global_line_id"] = pd.NA
     table["line_valid"] = False
     table["line_invalid_reason"] = ""
     summary_rows: list[dict[str, Any]] = []
+
+    def tolerance_for_roi(roi_id: Any) -> float:
+        if line_tolerance_px is not None:
+            return float(line_tolerance_px)
+        matched = suggestion.loc[suggestion["roi_id"].astype(str) == str(roi_id)]
+        if not matched.empty and np.isfinite(float(matched.iloc[0]["suggested_line_tolerance_px"])):
+            return float(matched.iloc[0]["suggested_line_tolerance_px"])
+        return 3.0
+
+    def tolerance_from_projection_values(values: pd.Series | np.ndarray) -> float:
+        if line_tolerance_px is not None:
+            return float(line_tolerance_px)
+        coords = pd.to_numeric(pd.Series(values), errors="coerce").dropna().sort_values().to_numpy(dtype=float)
+        gaps = np.diff(coords)
+        gaps = gaps[np.isfinite(gaps) & (gaps > 1e-9)]
+        if gaps.size:
+            q1, q3 = np.percentile(gaps, [25, 75])
+            median = float(np.median(gaps))
+            return float(max(q3, median + 0.5 * float(q3 - q1)))
+        return 3.0
+
+    def projection_a(values_px: pd.Series | np.ndarray) -> pd.Series:
+        values = pd.to_numeric(pd.Series(values_px), errors="coerce")
+        if pixel_to_nm is None:
+            return pd.Series(np.nan, index=values.index, dtype=float)
+        return values * float(pixel_to_nm) * 10.0
+
     for roi_id, group in table.groupby("roi_id", dropna=False, sort=False):
         valid_index = group.index[group.get("valid", True).astype(bool)]
         valid = table.loc[valid_index].copy()
@@ -2583,13 +2972,7 @@ def assign_pair_center_lines_by_projection(
         raw_s = centers @ unit
         origin = float(np.nanmin(raw_s))
         valid["projection_s_px"] = raw_s - origin
-        tolerance = line_tolerance_px
-        if tolerance is None:
-            matched = suggestion.loc[suggestion["roi_id"].astype(str) == str(roi_id)]
-            if not matched.empty and np.isfinite(float(matched.iloc[0]["suggested_line_tolerance_px"])):
-                tolerance = float(matched.iloc[0]["suggested_line_tolerance_px"])
-            else:
-                tolerance = 3.0
+        tolerance = tolerance_for_roi(roi_id)
         ordered = valid.sort_values("projection_s_px")
         raw_groups: list[list[int]] = []
         current: list[int] = []
@@ -2607,22 +2990,80 @@ def assign_pair_center_lines_by_projection(
         line_id = 1
         for raw_group in raw_groups:
             if len(raw_group) < int(min_pairs_per_line):
-                table.loc[raw_group, "line_invalid_reason"] = "line_too_short"
+                if mode == "per_roi":
+                    table.loc[raw_group, "line_invalid_reason"] = "line_too_short"
                 continue
             line_s = valid.loc[raw_group, "projection_s_px"]
             table.loc[raw_group, "line_id"] = int(line_id)
-            table.loc[raw_group, "line_valid"] = True
-            summary_rows.append(
-                {
-                    "roi_id": roi_id,
-                    "line_id": int(line_id),
-                    "n_pairs": int(len(raw_group)),
-                    "projection_s_median": float(line_s.median()),
-                    "line_tolerance_px": float(tolerance),
-                }
-            )
+            if mode == "per_roi":
+                table.loc[raw_group, "line_valid"] = True
+                summary_rows.append(
+                    {
+                        "roi_id": roi_id,
+                        "line_id": int(line_id),
+                        "global_line_id": pd.NA,
+                        "n_pairs": int(len(raw_group)),
+                        "projection_s_median": float(line_s.median()),
+                        "projection_s_median_A": float(line_s.median()) * float(pixel_to_nm) * 10.0 if pixel_to_nm is not None else np.nan,
+                        "line_tolerance_px": float(tolerance),
+                        "line_tolerance_A": float(tolerance) * float(pixel_to_nm) * 10.0 if pixel_to_nm is not None else np.nan,
+                        "line_index_mode": mode,
+                    }
+                )
             line_id += 1
-        table.loc[valid.index, "projection_s_px"] = valid["projection_s_px"]
+        if mode == "per_roi":
+            table.loc[valid.index, "projection_s_px"] = valid["projection_s_px"]
+            table.loc[valid.index, "projection_s_A"] = projection_a(valid["projection_s_px"]).to_numpy(dtype=float)
+
+    if mode == "global":
+        valid_index = table.index[table.get("valid", True).astype(bool)]
+        if len(valid_index):
+            valid = table.loc[valid_index].copy()
+            centers = valid[["center_x", "center_y"]].to_numpy(dtype=float)
+            raw_s = centers @ unit
+            origin = float(np.nanmin(raw_s))
+            valid["projection_s_px"] = raw_s - origin
+            tolerance = tolerance_from_projection_values(valid["projection_s_px"])
+            ordered = valid.sort_values("projection_s_px")
+            raw_groups = []
+            current = []
+            previous = None
+            for index, row in ordered.iterrows():
+                coord = float(row["projection_s_px"])
+                if previous is None or coord - previous <= float(tolerance):
+                    current.append(index)
+                else:
+                    raw_groups.append(current)
+                    current = [index]
+                previous = coord
+            if current:
+                raw_groups.append(current)
+            global_line_id = 1
+            for raw_group in raw_groups:
+                if len(raw_group) < int(min_pairs_per_line):
+                    table.loc[raw_group, "line_invalid_reason"] = "global_line_too_short"
+                    continue
+                line_s = valid.loc[raw_group, "projection_s_px"]
+                table.loc[raw_group, "global_line_id"] = int(global_line_id)
+                table.loc[raw_group, "line_valid"] = True
+                summary_rows.append(
+                    {
+                        "roi_id": "global",
+                        "line_id": pd.NA,
+                        "global_line_id": int(global_line_id),
+                        "n_pairs": int(len(raw_group)),
+                        "projection_s_median": float(line_s.median()),
+                        "projection_s_median_A": float(line_s.median()) * float(pixel_to_nm) * 10.0 if pixel_to_nm is not None else np.nan,
+                        "line_tolerance_px": float(tolerance),
+                        "line_tolerance_A": float(tolerance) * float(pixel_to_nm) * 10.0 if pixel_to_nm is not None else np.nan,
+                        "line_index_mode": mode,
+                    }
+                )
+                global_line_id += 1
+            table.loc[valid.index, "projection_s_px"] = valid["projection_s_px"]
+            table.loc[valid.index, "projection_s_A"] = projection_a(valid["projection_s_px"]).to_numpy(dtype=float)
+    if pixel_to_nm is not None:
+        table.attrs["pixel_to_nm"] = pixel_to_nm
     return table, pd.DataFrame(summary_rows)
 
 
@@ -2630,8 +3071,10 @@ def summarize_pair_lines_median_iqr(pair_line_table: pd.DataFrame) -> pd.DataFra
     columns = [
         "roi_id",
         "line_id",
+        "global_line_id",
         "n_pairs",
         "projection_s_median",
+        "projection_s_median_A",
         "distance_median_A",
         "distance_q1_A",
         "distance_q3_A",
@@ -2646,18 +3089,29 @@ def summarize_pair_lines_median_iqr(pair_line_table: pd.DataFrame) -> pd.DataFra
     data = pair_line_table.loc[pair_line_table.get("valid", True).astype(bool) & pair_line_table.get("line_valid", False).astype(bool)].copy()
     if data.empty:
         return pd.DataFrame(columns=columns)
+    index_column = "global_line_id" if "global_line_id" in data.columns and data["global_line_id"].notna().any() else "line_id"
     rows: list[dict[str, Any]] = []
-    for (roi_id, line_id), group in data.groupby(["roi_id", "line_id"], dropna=False, sort=True):
+    for (roi_id, line_index), group in data.groupby(["roi_id", index_column], dropna=False, sort=True):
         dist_A = pd.to_numeric(group.get("distance_A", np.nan), errors="coerce").dropna()
         dist_px = pd.to_numeric(group.get("distance_px", np.nan), errors="coerce").dropna()
         q1_A, q3_A = (np.nan, np.nan) if dist_A.empty else np.percentile(dist_A, [25, 75])
         q1_px, q3_px = (np.nan, np.nan) if dist_px.empty else np.percentile(dist_px, [25, 75])
+        line_id = pd.NA
+        global_line_id = pd.NA
+        if index_column == "global_line_id":
+            global_line_id = int(line_index)
+            if "line_id" in group.columns and group["line_id"].notna().any():
+                line_id = int(pd.to_numeric(group["line_id"], errors="coerce").dropna().mode().iloc[0])
+        else:
+            line_id = int(line_index)
         rows.append(
             {
                 "roi_id": roi_id,
-                "line_id": int(line_id),
+                "line_id": line_id,
+                "global_line_id": global_line_id,
                 "n_pairs": int(len(group)),
                 "projection_s_median": float(pd.to_numeric(group["projection_s_px"], errors="coerce").median()),
+                "projection_s_median_A": float(pd.to_numeric(group["projection_s_A"], errors="coerce").median()) if "projection_s_A" in group.columns and pd.to_numeric(group["projection_s_A"], errors="coerce").notna().any() else np.nan,
                 "distance_median_A": float(dist_A.median()) if len(dist_A) else np.nan,
                 "distance_q1_A": float(q1_A) if np.isfinite(q1_A) else np.nan,
                 "distance_q3_A": float(q3_A) if np.isfinite(q3_A) else np.nan,
@@ -2705,7 +3159,11 @@ def compute_group_centroids_by_roi(
                     "invalid_reason": "" if valid else "not_enough_points",
                 }
             )
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    pixel_to_nm = _pixel_to_nm_from_table(analysis_points)
+    if pixel_to_nm is not None:
+        result.attrs["pixel_to_nm"] = pixel_to_nm
+    return result
 
 
 def compute_group_pair_displacements(
@@ -2783,3 +3241,86 @@ def compute_group_pair_displacements(
                 }
             )
     return pd.DataFrame(rows)[columns]
+
+
+def add_crop_coordinate_columns_to_group_results(
+    group_centroid_table: pd.DataFrame,
+    group_displacement_table: pd.DataFrame | None = None,
+    *,
+    crop_origin_xy_px: tuple[float, float],
+    crop_basis_x_px: tuple[float, float] = (1.0, 0.0),
+    crop_basis_y_px: tuple[float, float] = (0.0, 1.0),
+    pixel_to_nm: float | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Add local/global px and nm coordinates to cropped group centroid outputs."""
+
+    origin = np.asarray(crop_origin_xy_px, dtype=float)
+    basis_x = np.asarray(crop_basis_x_px, dtype=float)
+    basis_y = np.asarray(crop_basis_y_px, dtype=float)
+    if pixel_to_nm is None:
+        pixel_to_nm = _pixel_to_nm_from_table(group_centroid_table)
+    scale = float(pixel_to_nm) if pixel_to_nm is not None and np.isfinite(float(pixel_to_nm)) and float(pixel_to_nm) > 0 else None
+
+    def local_to_global(local_x: pd.Series, local_y: pd.Series) -> tuple[pd.Series, pd.Series]:
+        x = pd.to_numeric(local_x, errors="coerce")
+        y = pd.to_numeric(local_y, errors="coerce")
+        global_x = origin[0] + x * basis_x[0] + y * basis_y[0]
+        global_y = origin[1] + x * basis_x[1] + y * basis_y[1]
+        return global_x, global_y
+
+    centroids = group_centroid_table.copy() if group_centroid_table is not None else pd.DataFrame()
+    if not centroids.empty and {"center_x", "center_y"}.issubset(centroids.columns):
+        centroids["center_x_local_px"] = pd.to_numeric(centroids["center_x"], errors="coerce")
+        centroids["center_y_local_px"] = pd.to_numeric(centroids["center_y"], errors="coerce")
+        global_x, global_y = local_to_global(centroids["center_x_local_px"], centroids["center_y_local_px"])
+        centroids["center_x_global_px"] = global_x
+        centroids["center_y_global_px"] = global_y
+        if scale is not None:
+            centroids["center_x_local_nm"] = centroids["center_x_local_px"] * scale
+            centroids["center_y_local_nm"] = centroids["center_y_local_px"] * scale
+            centroids["center_x_global_nm"] = centroids["center_x_global_px"] * scale
+            centroids["center_y_global_nm"] = centroids["center_y_global_px"] * scale
+        else:
+            for column in ("center_x_local_nm", "center_y_local_nm", "center_x_global_nm", "center_y_global_nm"):
+                centroids[column] = np.nan
+    if scale is not None:
+        centroids.attrs["pixel_to_nm"] = scale
+
+    displacements = None
+    if group_displacement_table is not None:
+        displacements = group_displacement_table.copy()
+        if not displacements.empty:
+            for label in ("A", "B"):
+                x_col = f"center_{label}_x"
+                y_col = f"center_{label}_y"
+                if {x_col, y_col}.issubset(displacements.columns):
+                    local_x = pd.to_numeric(displacements[x_col], errors="coerce")
+                    local_y = pd.to_numeric(displacements[y_col], errors="coerce")
+                    displacements[f"center_{label}_x_local_px"] = local_x
+                    displacements[f"center_{label}_y_local_px"] = local_y
+                    global_x, global_y = local_to_global(local_x, local_y)
+                    displacements[f"center_{label}_x_global_px"] = global_x
+                    displacements[f"center_{label}_y_global_px"] = global_y
+                    if scale is not None:
+                        displacements[f"center_{label}_x_local_nm"] = local_x * scale
+                        displacements[f"center_{label}_y_local_nm"] = local_y * scale
+                        displacements[f"center_{label}_x_global_nm"] = global_x * scale
+                        displacements[f"center_{label}_y_global_nm"] = global_y * scale
+                    else:
+                        for suffix in ("x_local_nm", "y_local_nm", "x_global_nm", "y_global_nm"):
+                            displacements[f"center_{label}_{suffix}"] = np.nan
+            displacements["dx_local_px"] = pd.to_numeric(displacements.get("dx_px", np.nan), errors="coerce")
+            displacements["dy_local_px"] = pd.to_numeric(displacements.get("dy_px", np.nan), errors="coerce")
+            if scale is not None:
+                displacements["dx_nm"] = displacements["dx_local_px"] * scale
+                displacements["dy_nm"] = displacements["dy_local_px"] * scale
+                displacements["distance_nm"] = pd.to_numeric(displacements.get("distance_px", np.nan), errors="coerce") * scale
+                if "distance_A" not in displacements.columns or not displacements["distance_A"].notna().any():
+                    displacements["distance_A"] = displacements["distance_nm"] * 10.0
+            else:
+                displacements["dx_nm"] = np.nan
+                displacements["dy_nm"] = np.nan
+                displacements["distance_nm"] = np.nan
+        if scale is not None:
+            displacements.attrs["pixel_to_nm"] = scale
+    return centroids, displacements

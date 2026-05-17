@@ -19,9 +19,12 @@ from em_atom_workbench.simple_quant import (
     compute_periodic_vector_segments,
     compute_group_centroids_by_roi,
     compute_group_pair_displacements,
+    add_crop_coordinate_columns_to_group_results,
+    crop_image_and_points_by_roi,
     expand_tasks_by_roi_basis,
     find_strict_mutual_nearest_pairs,
     flip_basis_vectors,
+    full_image_roi,
     make_pair_center_points,
     prepare_analysis_points,
     resolve_basis_vector_specs,
@@ -309,6 +312,36 @@ def test_pair_center_line_summary_uses_valid_lines_only() -> None:
     assert list(summary["distance_iqr_A"]) == [1.0, 1.0]
 
 
+def test_pair_center_line_assignment_global_mode_aligns_rois() -> None:
+    pair_table = pd.DataFrame(
+        {
+            "roi_id": ["roi_1", "roi_1", "roi_1", "roi_1", "roi_2", "roi_2"],
+            "center_x": [0.0, 0.2, 10.0, 10.2, 0.1, 10.1],
+            "center_y": [0.0, 0.0, 0.0, 0.0, 5.0, 5.0],
+            "distance_px": [2.0, 4.0, 6.0, 8.0, 3.0, 7.0],
+            "distance_A": [2.0, 4.0, 6.0, 8.0, 3.0, 7.0],
+            "valid": [True, True, True, True, True, True],
+        }
+    )
+    pair_table.attrs["pixel_to_nm"] = 0.1
+
+    assigned, grouping = assign_pair_center_lines_by_projection(
+        pair_table,
+        projection_vector=(1.0, 0.0),
+        line_tolerance_px=0.5,
+        min_pairs_per_line=2,
+        line_index_mode="global",
+    )
+    summary = summarize_pair_lines_median_iqr(assigned)
+
+    assert set(assigned["global_line_id"].dropna().astype(int)) == {1, 2}
+    assert assigned.loc[assigned["center_x"] < 1.0, "global_line_id"].dropna().astype(int).nunique() == 1
+    assert assigned.loc[assigned["center_x"] > 9.0, "global_line_id"].dropna().astype(int).nunique() == 1
+    assert grouping["line_index_mode"].eq("global").all()
+    assert grouping["projection_s_median_A"].notna().all()
+    assert set(summary["global_line_id"].dropna().astype(int)) == {1, 2}
+
+
 def test_task3_centroids_are_unweighted_and_displacement_direction_is_a_to_b() -> None:
     points = _analysis_points([0.0, 2.0, 10.0, 14.0], [0.0, 0.0, 1.0, 1.0], class_ids=[0, 0, 1, 1])
 
@@ -320,6 +353,100 @@ def test_task3_centroids_are_unweighted_and_displacement_direction_is_a_to_b() -
     assert by_group.loc["B", "center_x"] == pytest.approx(12.0)
     assert displacements.iloc[0]["dx_px"] == pytest.approx(11.0)
     assert displacements.iloc[0]["distance_A"] == pytest.approx(np.hypot(11.0, 1.0))
+
+
+def test_crop_image_and_points_by_roi_keeps_polygon_atoms_and_local_coordinates() -> None:
+    image = np.arange(40 * 50, dtype=float).reshape(40, 50)
+    points = _analysis_points([12.0, 18.0, 30.0], [12.0, 16.0, 30.0], class_ids=[0, 1, 1])
+    points.attrs["pixel_to_nm"] = 0.2
+    crop_roi = AnalysisROI(
+        roi_id="crop_1",
+        roi_name="crop_1",
+        polygon_xy_px=((10.0, 10.0), (22.0, 10.0), (22.0, 22.0), (10.0, 22.0)),
+    )
+
+    result = crop_image_and_points_by_roi(image, points, crop_roi)
+    cropped = result["points"]
+
+    assert result["image"].shape == (12, 12)
+    assert tuple(result["origin_xy_px"]) == (10.0, 10.0)
+    assert list(cropped["atom_id"]) == [0, 1]
+    assert list(cropped["global_x_px"]) == [12.0, 18.0]
+    assert list(cropped["x_px"]) == [2.0, 8.0]
+    assert list(cropped["y_px"]) == [2.0, 6.0]
+    assert cropped.attrs["pixel_to_nm"] == pytest.approx(0.2)
+    assert cropped["x_nm"].tolist() == pytest.approx([0.4, 1.6])
+    assert result["crop_table"].iloc[0]["width_nm"] == pytest.approx(2.4)
+    assert result["crop_table"].iloc[0]["crop_mode"] == "oriented_rectangle"
+
+
+def test_crop_image_and_points_by_rotated_rectangle_aligns_long_axis() -> None:
+    image = np.zeros((60, 60), dtype=float)
+    center = np.asarray([30.0, 30.0])
+    u = np.asarray([np.sqrt(0.5), np.sqrt(0.5)])
+    v = np.asarray([-np.sqrt(0.5), np.sqrt(0.5)])
+    half_long = 10.0
+    half_short = 3.0
+    corners = np.vstack(
+        [
+            center - half_long * u - half_short * v,
+            center + half_long * u - half_short * v,
+            center + half_long * u + half_short * v,
+            center - half_long * u + half_short * v,
+        ]
+    )
+    points = _analysis_points(
+        [float(center[0]), float((center + 5 * u)[0])],
+        [float(center[1]), float((center + 5 * u)[1])],
+        class_ids=[0, 1],
+    )
+    points.attrs["pixel_to_nm"] = 0.1
+    crop_roi = AnalysisROI(
+        roi_id="rot",
+        roi_name="rot",
+        polygon_xy_px=tuple((float(x), float(y)) for x, y in corners),
+    )
+
+    result = crop_image_and_points_by_roi(image, points, crop_roi)
+    cropped = result["points"]
+
+    assert result["crop_table"].iloc[0]["crop_mode"] == "oriented_rectangle"
+    assert result["image"].shape[1] >= result["image"].shape[0]
+    assert cropped.loc[1, "x_px"] - cropped.loc[0, "x_px"] == pytest.approx(5.0, abs=1e-6)
+    assert abs(cropped.loc[1, "y_px"] - cropped.loc[0, "y_px"]) < 1e-6
+
+
+def test_crop_full_image_roi_defaults_to_image_extent() -> None:
+    roi = full_image_roi(np.zeros((8, 10)), roi_id="full")
+
+    assert roi.roi_id == "full"
+    assert roi.polygon_xy_px == ((0.0, 0.0), (10.0, 0.0), (10.0, 8.0), (0.0, 8.0))
+
+
+def test_cropped_group_results_include_global_coordinates_and_nm_displacements() -> None:
+    points = _analysis_points([2.0, 4.0, 8.0], [1.0, 1.0, 5.0], class_ids=[0, 0, 1])
+    points.attrs["pixel_to_nm"] = 0.5
+
+    centroids = compute_group_centroids_by_roi(points, center_groups={"A": [0], "B": [1]})
+    displacements = compute_group_pair_displacements(centroids, center_pairs=[("A", "B")], pixel_to_nm=0.5)
+    annotated_centroids, annotated_displacements = add_crop_coordinate_columns_to_group_results(
+        centroids,
+        displacements,
+        crop_origin_xy_px=(10.0, 20.0),
+        pixel_to_nm=0.5,
+    )
+
+    center_a = annotated_centroids.set_index("group_name").loc["A"]
+    assert center_a["center_x_local_px"] == pytest.approx(3.0)
+    assert center_a["center_x_global_px"] == pytest.approx(13.0)
+    assert center_a["center_x_global_nm"] == pytest.approx(6.5)
+    row = annotated_displacements.iloc[0]
+    assert row["dx_px"] == pytest.approx(5.0)
+    assert row["dy_px"] == pytest.approx(4.0)
+    assert row["dx_nm"] == pytest.approx(2.5)
+    assert row["dy_nm"] == pytest.approx(2.0)
+    assert row["distance_nm"] == pytest.approx(np.hypot(5.0, 4.0) * 0.5)
+    assert row["angle_deg"] == pytest.approx(np.degrees(np.arctan2(4.0, 5.0)))
 
 
 def test_line_guides_group_axis_t_and_s() -> None:

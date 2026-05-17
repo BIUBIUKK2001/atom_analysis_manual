@@ -1,92 +1,103 @@
 # Atom Analysis Manual
 
-`atom_analysis_manual` is a notebook-first Python toolkit for atom-column localization and quantitative analysis in 2D electron microscopy images. The Python package in this repository is named `em-atom-workbench`.
+`atom_analysis_manual` 是一个面向二维原子分辨电子显微图像的 notebook-first Python 工具包。仓库中的 Python 包名为 `em-atom-workbench`。
 
-The package is designed for broad materials systems rather than one material family. Its main goal is a transparent workflow for atom-column finding, class-aware review, position refinement, and follow-up geometric quantification from curated coordinates. HfO2-specific helpers exist as one extension path, but they are not the central scope of the package.
+本项目的核心目标是服务于广泛材料体系的原子柱定位、类别复核、坐标精修和后续几何定量分析，而不是只针对某一个材料体系。HfO2 相关函数作为材料特定扩展保留在源码中，但不是项目的唯一或主要定位。
 
-The current user-facing workflow is built around two notebooks:
+当前用户工作流已经建立了三个 notebook：
 
-- `notebooks/01_Findatom.ipynb`: atom-column detection, classification, manual review, class-aware refinement, curation, checkpointing, and final atom-table export.
-- `notebooks/02_Simple_quantitative_spacing_analysis.ipynb`: task-based quantitative spacing analysis from the completed 01 session or exported atom table.
+- `notebooks/01_Findatom.ipynb`：通用原子柱定位、自动聚类、人工复核、按类别精修、最终筛选和原子表导出。
+- `notebooks/02_Simple_quantitative_spacing_analysis.ipynb`：基于 01 结果的任务式定量分析，包括周期统计、晶格索引、pair 距离、line grouping 和导出。
+- `notebooks/03_Cropped_group_centroid_analysis.ipynb`：裁剪 ROI 后的组质心与位移分析，用于从局部图像区域中统计类别组中心和组间位移。
 
-Automatic clustering labels and quantitative task outputs are intended as inspectable analysis aids. Physical interpretation remains user-reviewed.
+自动聚类类别和定量输出都应被视为可检查的分析结果。类别物理含义、ROI 选择、basis vector 选择和最终解释仍需用户判断。
 
-## Current Scope
+## 当前状态
 
-The source package already contains modules for image/session IO, atom detection, feature-based classification, napari review, refinement, local metrics, reference-lattice handling, local affine strain, vPCF, plotting, export, and session/checkpoint management.
+源码层已经包含以下能力：
 
-The notebook layer currently has two established workflows:
+- 图像/session 读取、active session、checkpoint 和 Excel/manifest 导出。
+- 单通道与多通道候选原子柱检测。
+- 基于局部图像特征的原子柱自动聚类。
+- napari 候选点复核、类别复核、ROI/basis vector 交互选择。
+- 按类别的亚像素坐标精修和最终筛选。
+- 简单定量分析：ROI/class 筛选、basis vector、nearest-forward segment、periodic-vector segment、pair segment、line guide、pair center、period statistics、group centroid 和 displacement。
+- 局域几何、reference lattice、local affine strain、vPCF、绘图和导出工具。
+- HfO2 heavy/light 多通道辅助函数。
 
-- `01_Findatom.ipynb`: generic atom-column localization and class-aware refinement.
-- `02_Simple_quantitative_spacing_analysis.ipynb`: ROI/class/basis/task-based quantitative analysis.
+notebook 层当前已经建立 01、02、03 三个主流程。后续仍可继续扩展更专门的材料体系 notebook、批处理 notebook 或论文图整理 notebook。
 
-The repository also contains:
-
-- Notebook builder scripts in `scripts/`.
-- Tests under `tests/` covering the notebooks, simple quantification, plotting, export helpers, local affine strain, and core workflow behavior.
-- A design note for local affine strain under `docs/local_affine_strain_plan.md`.
-- A placeholder example note under `examples/sample_data_placeholder.md`.
-
-Large raw data, generated figures, temporary files, caches, and analysis outputs are intentionally ignored by Git. Keep raw microscopy data and generated `results/` outputs local unless you explicitly decide to publish them.
-
-## Notebook Workflows
+## Notebook 工作流
 
 ### 01 Findatom
 
-`notebooks/01_Findatom.ipynb` guides the first-stage workflow:
+`01_Findatom.ipynb` 是第一阶段工作流，用于从图像得到可复核的原子坐标表。
 
-1. Configure image channels, primary display channel, dataset index, and optional manual pixel calibration.
-2. Initialize an `AnalysisSession`.
-3. Detect candidate atom columns on one or more channels.
-4. Review candidate points in napari before classification.
-5. Extract local image features and cluster atom columns into user-reviewable classes.
-6. Optionally review and edit class assignments in napari.
-7. Refine atom-column positions by class.
-8. Apply final automatic curation checks and keep/drop flags.
-9. Save active-session files and checkpoints.
-10. Export the final atom table to Excel.
+主要步骤：
+
+1. 设置图像通道、主显示通道、dataset index 和可选像素标定。
+2. 初始化 `AnalysisSession`。
+3. 在一个或多个通道上检测候选原子柱。
+4. 在 napari 中人工复核候选点。
+5. 提取局部图像特征并自动聚类。
+6. 在 napari 中复核类别。
+7. 按类别进行亚像素精修。
+8. 自动筛选重复点、边缘点、低质量点和异常拟合点。
+9. 保存 active session、checkpoint。
+10. 导出最终原子表 Excel。
 
 ### 02 Simple Quantitative Spacing Analysis
 
-`notebooks/02_Simple_quantitative_spacing_analysis.ipynb` starts from the completed 01 session, an active session file, or an exported atom table. It provides task-oriented quantification:
+`02_Simple_quantitative_spacing_analysis.ipynb` 从 01 完成的 session、active session 或导出的原子表开始，用于任务式间距和几何统计。
 
-1. Load session/image/atom table and prepare analysis points.
-2. Preview global ROI and class-colored atoms.
-3. Define or pick basis vectors.
-4. Task 1A: ROI/class-filtered a/b period statistics, histograms, period segment overlays, and Excel export.
-5. Task 1B: anchor/reference/origin-based lattice indexing, complete-cell tables, local strain, polygon maps, and Excel export.
-6. Task 2: strict mutual nearest pair finding, projection-line grouping, pair/line figures, and Excel export.
-7. Task 3: ROI/class group centroids, displacement vectors, group-center figures, and Excel export.
-8. Final export of tables, figures, configs, and manifest.
+当前任务：
 
-The 02 workflow uses unified `measurement_segments` tables where possible, along with supporting tables such as `analysis_points`, `basis_vector_table`, `pair_center_points`, and `line_guides`.
+1. 读取 session、图像和原子表。
+2. 预览全局 ROI 和类别着色点。
+3. 定义或交互选择 basis vectors。
+4. Task 1A：按 ROI/class 统计 a/b 周期，绘制直方图和 segment overlay，并导出 Excel。
+5. Task 1B：基于 anchor/reference/origin 做 lattice indexing、complete cell、local strain 和 polygon strain map，并导出 Excel。
+6. Task 2：寻找 strict mutual nearest pairs，按 projection line 分组，绘制 pair/line 图，并导出 Excel。
+7. 最终导出 tables、figures、configs 和 manifest。
 
-## Package Features
+02 中原先的 cropped group-centroid 分析已经拆分到 03 notebook。
 
-The `em_atom_workbench` package currently includes:
+### 03 Cropped Group-Centroid Analysis
 
-- Image/session IO: `load_image`, `load_image_bundle`, `AnalysisSession`, active-session helpers, and checkpoints.
-- Candidate detection: single-channel and multichannel local-extrema detection with deduplication and quality metrics.
-- Atom-column classification: patch feature extraction, clustering, class naming/coloring, summary tables, and napari class review.
-- Manual review and curation: candidate editing, final curation, QC flags, and keep/drop columns.
-- Refinement: class-aware subpixel refinement with adaptive patch sizing and fallback paths.
-- Simple quantification: ROI/class selection, basis vectors, nearest-forward segments, periodic-vector segments, pair segments, line guides, pair centers, period statistics, group centroids, and displacement summaries.
-- Local geometry: neighbor graph construction and local metric computation.
-- Reference lattice and strain: reference-lattice suggestion/building and local affine strain computation.
-- Plotting/export: overlays, class plots, basis checks, segment maps, histograms, polygon maps, Excel exports, figures, and manifests.
-- Material-specific extension helpers: HfO2 staged heavy/light multichannel detection helpers for aligned HAADF/iDPC/optional ABF data.
-- vPCF: local, batch, and session-level vector pair correlation analysis.
+`03_Cropped_group_centroid_analysis.ipynb` 用于在原图中先裁剪局部 ROI，再在裁剪坐标系内做组质心和位移分析。
 
-## Installation
+主要步骤：
 
-On Windows with conda, use the setup script:
+1. 读取 01 session、图像和原子表。
+2. 在原图上定义 crop ROI。
+3. 在裁剪图像上定义 measurement ROIs。
+4. 配置 class groups 和 center pairs。
+5. 计算 group centroids 与 displacements。
+6. 绘制裁剪区域中的 displacement arrows。
+7. 导出 Excel。
+8. 导出最终 manifest。
+
+## 代码模块
+
+主要源码位于 `src/em_atom_workbench/`：
+
+- `notebook_workflows.py`：notebook 级编排函数、Excel 导出、figure/manifest 导出。
+- `simple_quant.py`：ROI、basis、segment、period、pair、line、group centroid 和 displacement 计算。
+- `simple_quant_plotting.py`：simple quant 相关 overlay、histogram、basis、segment、polygon 和 displacement 绘图。
+- `simple_quant_widgets.py`：napari ROI、direction、basis vector 交互选择。
+- `classification.py`、`detect.py`、`refine.py`、`curate.py`：01 原子定位和分类主流程。
+- `strain.py`、`reference.py`、`metrics.py`、`lattice.py`、`vpcf.py`：后续几何和结构分析能力。
+
+## 安装
+
+Windows/conda 推荐方式：
 
 ```powershell
 .\setup_windows.ps1
 conda activate em-atom-workbench
 ```
 
-Manual installation:
+手动安装：
 
 ```powershell
 conda env create -f environment.yml
@@ -95,20 +106,21 @@ python -m pip install -e .
 python -m ipykernel install --user --name em-atom-workbench --display-name "Python (em-atom-workbench)"
 ```
 
-Optional interactive and DM-file features rely on packages such as napari, PyQt, HyperSpy, and RosettaSciIO. Core synthetic workflows and tests can run without opening napari.
+napari、PyQt、HyperSpy、RosettaSciIO 等属于交互或 DM 文件读取相关依赖。核心 synthetic 流程和大部分测试不需要打开 napari。
 
-## Regenerating Notebooks
+## 重新生成 Notebook
 
-The notebooks are generated from builder scripts:
+notebook 由脚本生成：
 
 ```powershell
 python scripts\build_01_findatom_notebook.py
 python scripts\build_02_simple_quant_notebook.py
+python scripts\build_03_cropped_group_centroid_notebook.py
 ```
 
-Use these scripts when notebook structure or source-controlled cells need to be rebuilt.
+修改 notebook 结构或同步源码单元时，优先修改 builder script，再重新生成 notebook。
 
-## Project Structure
+## 项目结构
 
 ```text
 .
@@ -122,10 +134,12 @@ Use these scripts when notebook structure or source-controlled cells need to be 
 |   `-- sample_data_placeholder.md
 |-- notebooks/
 |   |-- 01_Findatom.ipynb
-|   `-- 02_Simple_quantitative_spacing_analysis.ipynb
+|   |-- 02_Simple_quantitative_spacing_analysis.ipynb
+|   `-- 03_Cropped_group_centroid_analysis.ipynb
 |-- scripts/
 |   |-- build_01_findatom_notebook.py
-|   `-- build_02_simple_quant_notebook.py
+|   |-- build_02_simple_quant_notebook.py
+|   `-- build_03_cropped_group_centroid_notebook.py
 |-- src/
 |   `-- em_atom_workbench/
 |       |-- classification.py
@@ -149,33 +163,31 @@ Use these scripts when notebook structure or source-controlled cells need to be 
 `-- tests/
 ```
 
-## Testing
+## 测试
 
-Run the full test suite from the repository root:
+完整测试：
 
 ```powershell
 python -m pytest
 ```
 
-For the current notebook and simple-quantification workflow, the focused test set is:
+当前 notebook 和 simple quant 相关重点测试：
 
 ```powershell
-python -m pytest tests/test_simple_quant.py tests/test_simple_quant_plotting.py tests/test_notebook_02_simple_quant_smoke.py tests/test_notebook02_exports.py tests/test_strain_api.py tests/test_notebook_smoke.py
+python -m pytest tests/test_simple_quant.py tests/test_simple_quant_plotting.py tests/test_notebook_02_simple_quant_smoke.py tests/test_notebook02_exports.py tests/test_notebook_smoke.py
 ```
 
-The tests mostly use synthetic data so that algorithm interfaces, table schemas, session-stage transitions, notebook code cells, and exports can be checked without private microscopy datasets.
+测试主要使用 synthetic data，用来检查接口、表格 schema、notebook 代码单元、导出文件和 session 状态转移，不依赖私有显微数据。
 
-## Notes And Limitations
+## 注意事项
 
-- The package aims at broad atom-column localization and analysis workflows, not only HfO2.
-- The established notebook workflows are currently 01 Findatom and 02 Simple Quantitative Spacing Analysis.
-- Multichannel analysis assumes channels are already spatially aligned and have compatible shapes.
-- DM3/DM4 reading depends on optional HyperSpy/RosettaSciIO support and may need metadata checks for instrument-specific files.
-- Automatic class IDs are image-feature classes, not physical element labels by themselves.
-- Quantitative tasks depend on curated atom-coordinate quality, chosen ROIs, chosen classes, and user-defined or picked basis vectors.
-- HfO2-specific heavy/light helpers are available in the package as material-specific extensions, but there is not yet a separate HfO2 notebook workflow in this repository.
-- Generated outputs under `results/` are ignored except for `results/.gitkeep`.
+- 本项目面向广泛材料体系的原子柱定位和几何分析，不局限于 HfO2。
+- 多通道分析默认输入图像已经空间配准且 shape 兼容。
+- 自动 class id 是图像特征类别，不等同于元素标签。
+- 定量结果依赖用户选择的 ROI、class group、basis vector、pair 规则和裁剪区域。
+- DM3/DM4 读取依赖可选 HyperSpy/RosettaSciIO，真实仪器 metadata 需要逐例检查。
+- `results/` 中生成的输出默认不进入 Git，只保留 `results/.gitkeep`。
 
 ## License
 
-`pyproject.toml` currently declares MIT license metadata. Add a standalone `LICENSE` file before relying on this repository as a formally distributed open-source package.
+`pyproject.toml` 当前声明 MIT license metadata。正式开源分发前建议补充独立的 `LICENSE` 文件。
