@@ -20,6 +20,16 @@ def test_build_02_simple_quant_notebook_generates_compilable_notebook() -> None:
     source_by_id = {str(cell.get("id", "")): _cell_source(cell) for cell in notebook.get("cells", [])}
 
     for parameter in (
+        "OUTPUT_ROOT",
+        "DATASET_ID",
+        "ANALYSIS_ID",
+        "workspace",
+        "SESSION_SOURCE",
+        "01_final_curated",
+        "SAVE_PREVIEW_FIGURES",
+        "SAVE_FINAL_FIGURES",
+        "figures_preview",
+        "figures_final",
         "SOURCE_TABLE",
         "OPEN_ROI_PICKER",
         "OPEN_BASIS_VECTOR_PICKER",
@@ -36,6 +46,8 @@ def test_build_02_simple_quant_notebook_generates_compilable_notebook() -> None:
         "TASK2_PROJECTION_VECTOR",
         "TASK2_LINE_INDEX_MODE",
         "TASK1B_ANCHOR_SELECTION",
+        "USE_SHARED_MEDIAN_STRAIN_REFERENCE",
+        "REFERENCE_MEDIAN_ROI_ID",
         "period_segment_table",
         "period_summary_table",
         "pair_line_summary_table",
@@ -48,6 +60,8 @@ def test_build_02_simple_quant_notebook_generates_compilable_notebook() -> None:
     assert "all_analysis_points = analysis_points.copy()" in source_by_id["roi-selection"]
     assert "start_index=1" in source_by_id["roi-selection"]
     assert "class_group_mode=TASK1A_CLASS_GROUP_MODE" in source_by_id["task1a-run"]
+    assert "reference_table=custom_strain_reference_table" in source_by_id["task1b-shared-reference"]
+    assert "local_roi_theta" in source_by_id["task1b-shared-reference"]
     assert "TASK1A_HIST_TITLE_TEMPLATE" in source_by_id["task1a-figure-title-config"]
     assert '"{roi_display_label} {direction} {metric_short}"' in source_by_id["task1a-figure-title-config"]
     assert "task1A_histogram_title_table" in source_by_id["task1a-figures"]
@@ -62,6 +76,8 @@ def test_build_02_simple_quant_notebook_generates_compilable_notebook() -> None:
     assert "TASK3_ROIS" not in joined
     assert "export_task3_excel" not in joined
     assert "export_notebook02_results" in source_by_id["final-export"]
+    assert "workspace=workspace" in source_by_id["final-export"]
+    assert "session_source=SESSION_SOURCE" in source_by_id["final-export"]
     assert "group_weights" not in joined
 
     for cell in notebook.get("cells", []):
@@ -78,6 +94,16 @@ def test_build_03_cropped_group_centroid_notebook_generates_compilable_notebook(
     source_by_id = {str(cell.get("id", "")): _cell_source(cell) for cell in notebook.get("cells", [])}
 
     for parameter in (
+        "OUTPUT_ROOT",
+        "DATASET_ID",
+        "ANALYSIS_ID",
+        "workspace",
+        "SESSION_SOURCE",
+        "01_final_curated",
+        "SAVE_PREVIEW_FIGURES",
+        "SAVE_FINAL_FIGURES",
+        "figures_preview",
+        "figures_final",
         "SOURCE_TABLE",
         "USE_KEEP_ONLY",
         "IMAGE_CHANNEL",
@@ -112,7 +138,8 @@ def test_build_03_cropped_group_centroid_notebook_generates_compilable_notebook(
     assert "SHOW_SCALEBAR = False" in source_by_id["figure"]
     assert "arrow_tail_width=ARROW_TAIL_WIDTH" in source_by_id["figure"]
     assert "'magma'" in source_by_id["figure"]
-    assert "03_cropped_group_centroid" in joined
+    assert "03_group_centroid" in joined
+    assert "03_cropped_group_centroid" not in joined
 
     for cell in notebook.get("cells", []):
         assert cell.get("id")

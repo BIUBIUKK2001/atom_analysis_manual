@@ -4,7 +4,7 @@
 
 本项目的核心目标是服务于广泛材料体系的原子柱定位、类别复核、坐标精修和后续几何定量分析，而不是只针对某一个材料体系。HfO2 相关函数作为材料特定扩展保留在源码中，但不是项目的唯一或主要定位。
 
-当前用户工作流已经建立了三个 notebook：
+当前用户工作流已经建立了三个 notebook，并统一使用 analysis workspace 组织输入、stage session、表格、图像和 manifest：
 
 - `notebooks/01_Findatom.ipynb`：通用原子柱定位、自动聚类、人工复核、按类别精修、最终筛选和原子表导出。
 - `notebooks/02_Simple_quantitative_spacing_analysis.ipynb`：基于 01 结果的任务式定量分析，包括周期统计、晶格索引、pair 距离、line grouping 和导出。
@@ -17,6 +17,7 @@
 源码层已经包含以下能力：
 
 - 图像/session 读取、active session、checkpoint 和 Excel/manifest 导出。
+- project-level analysis workspace、stage session、shared metadata 和跨 notebook 状态恢复。
 - 单通道与多通道候选原子柱检测。
 - 基于局部图像特征的原子柱自动聚类。
 - napari 候选点复核、类别复核、ROI/basis vector 交互选择。
@@ -77,11 +78,84 @@ notebook 层当前已经建立 01、02、03 三个主流程。后续仍可继续
 7. 导出 Excel。
 8. 导出最终 manifest。
 
+## Analysis workspace and output structure
+
+新工作流推荐所有 notebook 共享同一个 analysis workspace。用户只需要在 01、02、03 开头设置同一组参数：
+
+```python
+OUTPUT_ROOT = Path("D:/analysis_outputs")
+DATASET_ID = "HZO_sample01_area03"
+ANALYSIS_ID = "run_001"
+```
+
+对应 workspace 路径为：
+
+```text
+D:/analysis_outputs/HZO_sample01_area03/run_001/
+```
+
+目录结构固定为：
+
+```text
+<OUTPUT_ROOT>/<DATASET_ID>/<ANALYSIS_ID>/
+  project_config.json
+  state/
+    active_session.pkl
+    active_session.json
+    latest_session.json
+    sessions/
+      01_loaded.pkl
+      01_candidate_reviewed.pkl
+      01_class_reviewed.pkl
+      01_refined.pkl
+      01_final_curated.pkl
+      02_simple_quant.pkl
+      03_group_centroid.pkl
+  shared/
+    channel_summary.csv
+    pixel_calibration.json
+    input_metadata.json
+  01_findatom/
+    configs/
+    tables/
+    figures_preview/
+    figures_final/
+    checkpoints/
+    manifest.json
+  02_simple_quant/
+    configs/
+    tables/
+    figures_preview/
+    figures_final/
+    session/
+    manifest.json
+  03_group_centroid/
+    configs/
+    tables/
+    figures_preview/
+    figures_final/
+    session/
+    manifest.json
+  manifests/
+    01_findatom_manifest.json
+    02_simple_quant_manifest.json
+    03_group_centroid_manifest.json
+    project_manifest.json
+```
+
+`state/sessions/01_final_curated.pkl` 是 02 和 03 的默认入口。`state/active_session.pkl` 是当前 workspace 的 latest pointer，用于恢复最近运行状态；它不再代表全项目唯一入口。重新打开 notebook 时，只要设置同样的 `OUTPUT_ROOT / DATASET_ID / ANALYSIS_ID`，02/03 就能继续读取 01 保存的 final curated session。
+
+`figures_preview/` 用于可选保存调参预览图，默认不保存。`figures_final/` 用于正式导出的图，标题、字体、格式、dpi 和部分 legend/颜色开关在 notebook 的 final export 参数 cell 中设置。`configs/` 保存运行参数，`tables/` 保存 CSV/Excel 表格，stage `manifest.json` 和 `manifests/` 记录导出路径、session 来源和 workspace schema。
+
+分析多个数据时，切换 `DATASET_ID`；同一数据的不同分析版本则切换 `ANALYSIS_ID`。旧的 `results/_active_session.pkl` 兼容逻辑仍保留，可通过 `SESSION_PATH` 手动读取，但新流程推荐使用 workspace 与 `state/sessions/*`。
+
 ## 代码模块
 
 主要源码位于 `src/em_atom_workbench/`：
 
 - `notebook_workflows.py`：notebook 级编排函数、Excel 导出、figure/manifest 导出。
+- `workspace.py`：project-level workspace、stage session、shared metadata 和 manifest 管理。
+- `figure_config.py`：final figure export 参数规范化，不改变绘图核心 API。
 - `simple_quant.py`：ROI、basis、segment、period、pair、line、group centroid 和 displacement 计算。
 - `simple_quant_plotting.py`：simple quant 相关 overlay、histogram、basis、segment、polygon 和 displacement 绘图。
 - `simple_quant_widgets.py`：napari ROI、direction、basis vector 交互选择。
@@ -146,6 +220,7 @@ python scripts\build_03_cropped_group_centroid_notebook.py
 |       |-- curate.py
 |       |-- detect.py
 |       |-- export.py
+|       |-- figure_config.py
 |       |-- io.py
 |       |-- lattice.py
 |       |-- metrics.py
@@ -159,6 +234,7 @@ python scripts\build_03_cropped_group_centroid_notebook.py
 |       |-- simple_quant_widgets.py
 |       |-- strain.py
 |       |-- vpcf.py
+|       |-- workspace.py
 |       `-- widgets.py
 `-- tests/
 ```
@@ -174,7 +250,7 @@ python -m pytest
 当前 notebook 和 simple quant 相关重点测试：
 
 ```powershell
-python -m pytest tests/test_simple_quant.py tests/test_simple_quant_plotting.py tests/test_notebook_02_simple_quant_smoke.py tests/test_notebook02_exports.py tests/test_notebook_smoke.py
+python -m pytest tests/test_workspace.py tests/test_simple_quant.py tests/test_simple_quant_plotting.py tests/test_notebook_02_simple_quant_smoke.py tests/test_notebook02_exports.py tests/test_notebook_smoke.py
 ```
 
 测试主要使用 synthetic data，用来检查接口、表格 schema、notebook 代码单元、导出文件和 session 状态转移，不依赖私有显微数据。

@@ -117,5 +117,5 @@ def test_export_notebook03_results_writes_manifest_tables_and_checkpoint(tmp_pat
     assert payload["workflow"] == "cropped_group_centroid_notebook03"
     assert payload["tables"]["group_centroids"].endswith("group_centroids.csv")
     assert payload["excel_exports"]["cropped_group_centroid"]["path"] == "cropped.xlsx"
-    assert Path(manifest["session_checkpoint"]).name == "03_cropped_group_centroid_session.pkl"
-    assert session.current_stage == "cropped_group_centroid"
+    assert Path(manifest["session_checkpoint"]).name == "03_group_centroid.pkl"
+    assert session.current_stage == "group_centroid"

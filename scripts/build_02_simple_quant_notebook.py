@@ -97,6 +97,7 @@ from em_atom_workbench import (
     run_period_statistics_ab,
     select_points_by_roi_and_class,
     summarize_pair_lines_median_iqr,
+    initialize_analysis_workspace,
 )
 from em_atom_workbench.notebook_workflows import (
     export_notebook02_results,
@@ -122,26 +123,52 @@ plt.rcParams['axes.unicode_minus'] = False
 """,
         ),
         md(
+            "workspace-md",
+            """
+## 0. Workspace parameters
+
+这一格只定义当前 dataset/run 的统一 workspace。02 默认从 `workspace/state/sessions/01_final_curated.pkl` 读取 01 的最终 curated session，并把所有 02 输出写入 `02_simple_quant/`。
+""",
+        ),
+        code(
+            "workspace-parameters",
+            """
+OUTPUT_ROOT = PROJECT_ROOT / 'results'
+DATASET_ID = 'dataset_001'
+ANALYSIS_ID = 'run_001'
+
+workspace = initialize_analysis_workspace(
+    output_root=OUTPUT_ROOT,
+    dataset_id=DATASET_ID,
+    analysis_id=ANALYSIS_ID,
+)
+
+# 为兼容旧 wrapper，RESULT_ROOT 仍然存在；新流程中它指向当前 workspace.root。
+RESULT_ROOT = workspace.root
+
+# SESSION_SOURCE='01_final_curated' 是推荐默认入口：
+# workspace/state/sessions/01_final_curated.pkl
+SESSION_SOURCE = '01_final_curated'
+
+# SESSION_PATH=None 时读取 SESSION_SOURCE。
+# 如需读取旧 results/_active_session.pkl 或手动 checkpoint，可在这里填 pickle 路径。
+SESSION_PATH = None
+
+print(f'workspace: {workspace.root}')
+print(f'default session: {workspace.sessions_dir / (SESSION_SOURCE + ".pkl")}')
+""",
+        ),
+        md(
             "load-md",
             """
-## 0. Load session / image / atom table
+## 1. Load session / image / atom table
 
-这一组 cell 只负责读取 01 notebook 保存的 active session、原始图像和原子坐标表。这里的 class filter 只用于预览，不会决定 Task 1A/1B/2/3 的正式分析对象；正式任务都会在自己的配置 cell 中重新选择 ROI 和 class。
+这一组 cell 只负责读取 01 notebook 保存的 `01_final_curated` stage session、原始图像和原子坐标表。这里的 class filter 只用于预览，不会决定 Task 1A/1B/2 的正式分析对象；正式任务都会在自己的配置 cell 中重新选择 ROI 和 class。
 """,
         ),
         code(
             "load-session",
             """
-# RESULT_ROOT：所有 notebook02 输出的根目录。
-# 默认使用项目根目录下的 results，与 01 notebook 的 active session 约定保持一致。
-RESULT_ROOT = PROJECT_ROOT / 'results'
-RESULT_ROOT.mkdir(exist_ok=True)
-
-# SESSION_PATH：
-# - None：读取 RESULT_ROOT / '_active_session.pkl'，这是 01 notebook 默认保存的位置；
-# - Path 或字符串：读取你手动指定的 session pickle。
-SESSION_PATH = None
-
 # SOURCE_TABLE：选择 01 产生的哪一张原子坐标表作为分析起点。
 # curated：正式定量推荐；refined：检查精修点；candidate：通常仅用于诊断。
 SOURCE_TABLE = 'curated'
@@ -166,6 +193,9 @@ CLASS_ID_FILTER = None
 # 并解析显示图像。这里 rois=None，所以只是全局预览，不做 ROI 展开。
 context_preview = initialize_simple_quant_v2_analysis(
     session_path=SESSION_PATH,
+    workspace=workspace,
+    session_source=SESSION_SOURCE,
+    required_stage=None,
     result_root=RESULT_ROOT,
     source_table=SOURCE_TABLE,
     use_keep_only=USE_KEEP_ONLY,
@@ -225,6 +255,9 @@ elif ROIS is None:
 # 同一个原子若落入多个 ROI，会在 analysis_points 中出现多行，用 roi_id/scope_id 区分。
 context = initialize_simple_quant_v2_analysis(
     session_path=SESSION_PATH,
+    workspace=workspace,
+    session_source=SESSION_SOURCE,
+    required_stage=None,
     result_root=RESULT_ROOT,
     source_table=SOURCE_TABLE,
     use_keep_only=USE_KEEP_ONLY,
@@ -247,7 +280,10 @@ roi_table = context['roi_table']
 image = context['image']
 output_dirs = context['output_dirs']
 
-# figures 用来收集 notebook 中生成的正式图，final export cell 会统一保存。
+# preview_figures 只收集调参预览图；默认不保存。
+preview_figures = {}
+
+# figures 用来收集 notebook 中生成的正式图，final export cell 会统一保存到 figures_final。
 figures = {}
 
 # excel_exports 用来记录每个任务独立 Excel 的路径和写入状态。
@@ -271,7 +307,7 @@ fig, image_ax, side_ax = plot_measurement_segments_on_image(
     show_axes=False,
     title='02A class-colored analysis points',
 )
-figures['02A_analysis_points_preview'] = fig
+preview_figures['02A_analysis_points_preview'] = fig
 display(fig)
 plt.close(fig)
 """,
@@ -364,7 +400,7 @@ fig, image_ax, legend_ax = plot_basis_check_on_image(
     show_axes=False,
     title='Task 1 ROI and a/b basis check',
 )
-figures['02B_task1_basis_check'] = fig
+preview_figures['02B_task1_basis_check'] = fig
 display(fig)
 plt.close(fig)
 """,
@@ -741,6 +777,98 @@ display(cell_table.head())
 """,
         ),
         md(
+            "task1b-shared-reference-md",
+            """
+## 8b. Optional: use one ROI median cell size as strain reference
+
+默认情况下，`compute_cell_strain(raw_cell_table)` 会对每个 ROI 分别用本 ROI 内 valid cells 的 median `a_local / b_local / theta / area` 作为 strain reference。
+
+如果你希望所有 ROI 使用同一个参考 ROI 的晶胞尺寸作为 `a_ref / b_ref`，可以运行下面这个 cell。它只改变 strain reference，不会重新做 lattice indexing，也不会重新决定哪些 anchor 点组成 cell。每个 ROI 的 `theta_ref_deg` 仍使用本 ROI 自己的 median，以避免把参考 ROI 的方向或夹角强行套到其他取向不同的 ROI。
+""",
+        ),
+        code(
+            "task1b-shared-reference",
+            """
+# USE_SHARED_MEDIAN_STRAIN_REFERENCE：
+# False 保持默认逻辑：每个 ROI 用自己的 valid cell median 作为 reference。
+# True 时：所有 ROI 共享 REFERENCE_MEDIAN_ROI_ID 的 a_local/b_local median 作为 a_ref/b_ref。
+USE_SHARED_MEDIAN_STRAIN_REFERENCE = False
+
+# 参考 ROI。只有 USE_SHARED_MEDIAN_STRAIN_REFERENCE=True 时才会使用。
+REFERENCE_MEDIAN_ROI_ID = 'roi_1'
+
+if USE_SHARED_MEDIAN_STRAIN_REFERENCE:
+    # 先用默认方式计算 geometry，得到每个 cell 的 a_local / b_local / theta_local_deg / area_local。
+    # 这一步不改变 lattice indexing，也不改变 raw_cell_table 中已确定的 cell 四角点。
+    _geometry_cell_table, _default_reference_table = compute_cell_strain(raw_cell_table)
+
+    ref_group = _geometry_cell_table.loc[
+        (_geometry_cell_table['roi_id'].astype(str) == str(REFERENCE_MEDIAN_ROI_ID))
+        & (_geometry_cell_table.get('valid', False).astype(bool))
+    ].copy()
+
+    if ref_group.empty:
+        raise ValueError(f'No valid cells found in reference ROI: {REFERENCE_MEDIAN_ROI_ID!r}')
+
+    shared_a_ref = float(ref_group['a_local'].median())
+    shared_b_ref = float(ref_group['b_local'].median())
+
+    # 关键：只共享参考 ROI 的 a/b 晶胞大小中位数。
+    # theta_ref 仍然用每个 ROI 自己的 median，避免把参考 ROI 的方向/夹角套到其他 ROI。
+    custom_reference_rows = []
+    for roi_id, group in _geometry_cell_table.groupby('roi_id', dropna=False, sort=False):
+        valid = group.loc[group.get('valid', False).astype(bool)].copy()
+        if valid.empty:
+            theta_ref = np.nan
+            area_ref = np.nan
+        else:
+            theta_ref = float(valid['theta_local_deg'].median())
+            area_ref = shared_a_ref * shared_b_ref * abs(np.sin(np.deg2rad(theta_ref)))
+
+        custom_reference_rows.append({
+            'roi_id': roi_id,
+            'a_ref': shared_a_ref,
+            'b_ref': shared_b_ref,
+            'theta_ref_deg': theta_ref,
+            'area_ref': area_ref,
+            'reference_source': f'median_cell_size_from_{REFERENCE_MEDIAN_ROI_ID}_local_roi_theta',
+        })
+
+    custom_strain_reference_table = pd.DataFrame(custom_reference_rows)
+
+    # 用自定义 reference 重新计算 strain。
+    cell_table, strain_reference_table = compute_cell_strain(
+        raw_cell_table,
+        reference_table=custom_strain_reference_table,
+    )
+
+    valid_cell_table = cell_table.loc[
+        cell_table.get('valid', False).astype(bool)
+    ].copy() if not cell_table.empty else pd.DataFrame()
+
+    invalid_cell_table = cell_table.loc[
+        ~cell_table.get('valid', False).astype(bool)
+    ].copy() if not cell_table.empty else pd.DataFrame()
+
+    task1B_qc_summary = pd.DataFrame([
+        {'metric': 'anchor_rows', 'value': len(anchor_lattice_table)},
+        {'metric': 'valid_anchor_rows', 'value': int(anchor_lattice_table.get('valid_anchor', pd.Series(dtype=bool)).sum()) if not anchor_lattice_table.empty else 0},
+        {'metric': 'cell_rows', 'value': len(cell_table)},
+        {'metric': 'valid_cells', 'value': len(valid_cell_table)},
+        {'metric': 'invalid_cells', 'value': len(invalid_cell_table)},
+        {'metric': 'reference_median_roi_id', 'value': REFERENCE_MEDIAN_ROI_ID},
+        {'metric': 'shared_a_ref_px', 'value': shared_a_ref},
+        {'metric': 'shared_b_ref_px', 'value': shared_b_ref},
+    ])
+
+    display(strain_reference_table)
+    display(task1B_qc_summary)
+    display(cell_table.head())
+else:
+    print('USE_SHARED_MEDIAN_STRAIN_REFERENCE=False；保持默认：每个 ROI 使用自己的 valid cell median 作为 strain reference。')
+""",
+        ),
+        md(
             "task1b-fig-md",
             """
 ## 9. Task 1B: polygon strain maps
@@ -1032,6 +1160,62 @@ display(task2_excel)
 """,
         ),
         code(
+            "final-figure-export-parameters",
+            """
+# =========================
+# Final figure export parameters
+# =========================
+# preview figures 只用于调参检查；默认不保存；若启用则写入 02_simple_quant/figures_preview。
+SAVE_PREVIEW_FIGURES = False
+
+# final figures 是正式导出的论文/报告候选图，保存到 02_simple_quant/figures_final。
+SAVE_FINAL_FIGURES = True
+
+FIGURE_FORMATS = ('pdf', 'png', 'svg')
+FIGURE_DPI = 600
+FIGURE_FONT_FAMILY = 'Arial'
+FIGURE_FONT_SIZE = 9
+
+FIG_02A = {
+    'save': True,
+    'title': 'Analysis points and ROIs',
+    'show_title': True,
+    'show_class_legend': True,
+    'show_roi_legend': True,
+    'show_task_legend': False,
+    'show_basis_vectors': False,
+    'show_roi_outlines': True,
+    'font_family': FIGURE_FONT_FAMILY,
+    'font_size': FIGURE_FONT_SIZE,
+    'formats': FIGURE_FORMATS,
+    'dpi': FIGURE_DPI,
+}
+
+FIG_02C = {
+    'save': True,
+    'title': 'Measurement segments',
+    'show_title': True,
+    'show_class_legend': True,
+    'show_roi_legend': True,
+    'show_task_legend': True,
+    'show_basis_vectors': True,
+    'show_roi_outlines': True,
+    'font_family': FIGURE_FONT_FAMILY,
+    'font_size': FIGURE_FONT_SIZE,
+    'formats': FIGURE_FORMATS,
+    'dpi': FIGURE_DPI,
+}
+
+FINAL_FIGURE_SPECS = {
+    'task1A_period_segment_overlay': FIG_02C,
+    'task2_pair_overlay': {'save': True, 'title': 'Task 2 pair overlay', 'font_family': FIGURE_FONT_FAMILY, 'font_size': FIGURE_FONT_SIZE, 'formats': FIGURE_FORMATS, 'dpi': FIGURE_DPI},
+    'task2_pair_center_line_assignment': {'save': True, 'title': 'Pair-center line assignment', 'font_family': FIGURE_FONT_FAMILY, 'font_size': FIGURE_FONT_SIZE, 'formats': FIGURE_FORMATS, 'dpi': FIGURE_DPI},
+    'task2_projection_spacing_histogram': {'save': True, 'title': 'Projection spacing histogram', 'font_family': FIGURE_FONT_FAMILY, 'font_size': FIGURE_FONT_SIZE, 'formats': FIGURE_FORMATS, 'dpi': FIGURE_DPI},
+    'task2_pair_line_distance_iqr': {'save': True, 'title': 'Pair-line distance median and IQR', 'font_family': FIGURE_FONT_FAMILY, 'font_size': FIGURE_FONT_SIZE, 'formats': FIGURE_FORMATS, 'dpi': FIGURE_DPI},
+}
+""",
+        ),
+        code(
             "final-export",
             """
 # notebook02_tables：最终统一导出的 CSV 表。
@@ -1054,6 +1238,9 @@ notebook02_tables = {
 # 这里只记录关键运行参数；每个任务的完整参数还会写入各自 Excel。
 notebook02_configs = {
     'notebook02_config': {
+        'dataset_id': DATASET_ID,
+        'analysis_id': ANALYSIS_ID,
+        'session_source': SESSION_SOURCE,
         'source_table': SOURCE_TABLE,
         'use_keep_only': USE_KEEP_ONLY,
         'image_channel': context['image_channel'],
@@ -1068,7 +1255,8 @@ notebook02_configs = {
 
 # export_notebook02_results 会统一保存：
 # - CSV tables；
-# - figures 中收集的正式图；
+# - preview figures（仅 SAVE_PREVIEW_FIGURES=True 时）；
+# - figures 中收集的正式图到 figures_final；
 # - configs JSON；
 # - excel_exports 中记录的 Task 1A / Task 1B / Task 2 Excel；
 # - session checkpoint；
@@ -1078,10 +1266,16 @@ manifest = export_notebook02_results(
     output_dirs=output_dirs,
     tables=notebook02_tables,
     figures=figures,
+    preview_figures=preview_figures,
     configs=notebook02_configs,
     excel_exports=excel_exports,
-    figure_formats=FIG_STYLE.normalized_formats(),
-    figure_dpi=FIG_STYLE.fig_dpi,
+    workspace=workspace,
+    session_source=SESSION_SOURCE,
+    save_preview_figures=SAVE_PREVIEW_FIGURES,
+    save_final_figures=SAVE_FINAL_FIGURES,
+    final_figure_specs=FINAL_FIGURE_SPECS,
+    figure_formats=FIGURE_FORMATS,
+    figure_dpi=FIGURE_DPI,
 )
 display(manifest)
 """,

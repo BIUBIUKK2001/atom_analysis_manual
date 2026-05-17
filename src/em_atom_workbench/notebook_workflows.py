@@ -84,6 +84,18 @@ from .utils import (
     synthetic_hfo2_multichannel_bundle,
     write_json,
 )
+from .figure_config import apply_figure_text_style, normalize_figure_spec
+from .workspace import (
+    AnalysisWorkspace,
+    collect_project_manifest,
+    export_stage_figure,
+    initialize_analysis_workspace,
+    load_stage_session,
+    save_stage_session,
+    stage_session_path,
+    write_stage_manifest,
+    write_shared_workspace_files,
+)
 
 
 @dataclass(frozen=True)
@@ -117,6 +129,55 @@ def display_notebook_result(result: NotebookResult) -> None:
         plt.close(figure)
     for message in result.messages:
         print(message)
+
+
+def initialize_workspace_for_notebook(
+    output_root: str | Path,
+    dataset_id: str,
+    analysis_id: str,
+) -> AnalysisWorkspace:
+    return initialize_analysis_workspace(output_root, dataset_id, analysis_id)
+
+
+def resolve_notebook_session(
+    workspace: AnalysisWorkspace,
+    session_source: str = "01_final_curated",
+    session_path: str | Path | None = None,
+    required_stage: str | None = None,
+) -> AnalysisSession:
+    return load_stage_session(
+        workspace,
+        session_source,
+        session_path=session_path,
+        required_stage=required_stage,
+    )
+
+
+def save_notebook_stage_session(
+    session: AnalysisSession,
+    workspace: AnalysisWorkspace,
+    stage_name: str,
+    update_active: bool = True,
+) -> Path:
+    return save_stage_session(session, workspace, stage_name, update_active=update_active)
+
+
+def stage_output_dirs(workspace: AnalysisWorkspace, stage_name: str) -> dict[str, Path]:
+    from .workspace import get_stage_dir
+
+    stage = get_stage_dir(workspace, stage_name)
+    dirs = {
+        "stage": stage,
+        "output": stage,
+        "configs": stage / "configs",
+        "tables": stage / "tables",
+        "figures_preview": stage / "figures_preview",
+        "figures_final": stage / "figures_final",
+        "session": stage / "session",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return dirs
 
 
 def filter_points_by_role(points: pd.DataFrame, role: str) -> pd.DataFrame:
@@ -229,12 +290,14 @@ def _simple_quant_stage_summary(
     return pd.DataFrame(rows)
 
 
-def _simple_quant_output_dirs(result_root: str | Path) -> dict[str, Path]:
+def _legacy_simple_quant_output_dirs(result_root: str | Path) -> dict[str, Path]:
     output_dir = Path(result_root) / "02_simple_quant"
     dirs = {
         "output": output_dir,
         "tables": output_dir / "tables",
         "figures": output_dir / "figures",
+        "figures_preview": output_dir / "figures_preview",
+        "figures_final": output_dir / "figures_final",
         "configs": output_dir / "configs",
         "session": output_dir / "session",
     }
@@ -243,12 +306,37 @@ def _simple_quant_output_dirs(result_root: str | Path) -> dict[str, Path]:
     return dirs
 
 
-def cropped_group_centroid_output_dirs(result_root: str | Path) -> dict[str, Path]:
-    output_dir = Path(result_root) / "03_cropped_group_centroid"
+def simple_quant_output_dirs(
+    workspace: AnalysisWorkspace | None = None,
+    result_root: str | Path | None = None,
+) -> dict[str, Path]:
+    if workspace is not None:
+        dirs = stage_output_dirs(workspace, "02_simple_quant")
+        dirs["figures"] = dirs["figures_final"]
+        return dirs
+    return _legacy_simple_quant_output_dirs(result_root or "results")
+
+
+def _simple_quant_output_dirs(result_root: str | Path) -> dict[str, Path]:
+    return _legacy_simple_quant_output_dirs(result_root)
+
+
+def cropped_group_centroid_output_dirs(
+    result_root: str | Path | None = None,
+    *,
+    workspace: AnalysisWorkspace | None = None,
+) -> dict[str, Path]:
+    if workspace is not None:
+        dirs = stage_output_dirs(workspace, "03_group_centroid")
+        dirs["figures"] = dirs["figures_final"]
+        return dirs
+    output_dir = Path(result_root or "results") / "03_cropped_group_centroid"
     dirs = {
         "output": output_dir,
         "tables": output_dir / "tables",
         "figures": output_dir / "figures",
+        "figures_preview": output_dir / "figures_preview",
+        "figures_final": output_dir / "figures_final",
         "configs": output_dir / "configs",
         "session": output_dir / "session",
     }
@@ -463,8 +551,12 @@ def _roi_table_from_points(points: pd.DataFrame) -> pd.DataFrame:
 
 def initialize_simple_quant_v2_analysis(
     *,
-    session_path: str | Path | None,
-    result_root: str | Path,
+    session_path: str | Path | None = None,
+    result_root: str | Path | None = None,
+    workspace: AnalysisWorkspace | None = None,
+    session: AnalysisSession | None = None,
+    session_source: str = "01_final_curated",
+    required_stage: str | None = None,
     source_table: str,
     use_keep_only: bool,
     class_filter: tuple[str, ...] | list[str] | set[str] | None,
@@ -473,7 +565,18 @@ def initialize_simple_quant_v2_analysis(
     image_channel: str | None,
     image_key: str,
 ) -> dict[str, Any]:
-    session = load_or_connect_session(result_root, session_path=session_path)
+    if session is None:
+        if workspace is not None:
+            session = load_stage_session(
+                workspace,
+                session_source,
+                session_path=session_path,
+                required_stage=required_stage,
+            )
+        else:
+            if result_root is None:
+                raise ValueError("result_root is required when workspace and session are not provided.")
+            session = load_or_connect_session(result_root, session_path=session_path, required_stage=required_stage)
     analysis_points = prepare_analysis_points(
         session,
         source_table=source_table,
@@ -487,7 +590,7 @@ def initialize_simple_quant_v2_analysis(
         image_channel=image_channel,
         image_key=image_key,
     )
-    output_dirs = _simple_quant_output_dirs(result_root)
+    output_dirs = simple_quant_output_dirs(workspace=workspace, result_root=result_root or "results")
     roi_table = _roi_table_from_points(analysis_points)
     summary = pd.DataFrame(
         [
@@ -538,6 +641,7 @@ def export_simple_quant_v2_analysis(
     session: AnalysisSession,
     output_dirs: dict[str, Path] | None = None,
     result_root: str | Path | None = None,
+    workspace: AnalysisWorkspace | None = None,
     analysis_points: pd.DataFrame | None = None,
     roi_table: pd.DataFrame | None = None,
     basis_vector_table: pd.DataFrame | None = None,
@@ -547,9 +651,14 @@ def export_simple_quant_v2_analysis(
     line_guides: pd.DataFrame | None = None,
     summaries: pd.DataFrame | None = None,
     figures: dict[str, Any] | None = None,
+    preview_figures: dict[str, Any] | None = None,
+    save_preview_figures: bool = False,
+    final_figure_specs: dict[str, Any] | None = None,
+    figure_formats: tuple[str, ...] = ("pdf", "png", "svg"),
+    figure_dpi: int = 600,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    dirs = output_dirs or _simple_quant_output_dirs(result_root or "results")
+    dirs = output_dirs or simple_quant_output_dirs(workspace=workspace, result_root=result_root or "results")
     tables = {
         "analysis_points": analysis_points,
         "roi_table": roi_table,
@@ -567,24 +676,77 @@ def export_simple_quant_v2_analysis(
         target = dirs["tables"] / f"{name}.csv"
         table.to_csv(target, index=False)
         table_paths[name] = str(target)
-    figure_paths = _save_simple_quant_figures(figures or {}, dirs["figures"])
+    figure_paths: dict[str, list[str]] = {}
+    for name, figure in (figures or {}).items():
+        if figure is None:
+            continue
+        spec = normalize_figure_spec((final_figure_specs or {}).get(name, {}), name=name)
+        if not spec["save"]:
+            continue
+        if spec.get("show_title", True) is False and getattr(figure, "axes", None):
+            for axis in figure.axes:
+                axis.set_title("")
+        apply_figure_text_style(figure, spec)
+        if workspace is not None:
+            paths = export_stage_figure(
+                workspace,
+                "02_simple_quant",
+                name,
+                figure,
+                final=True,
+                formats=spec.get("formats", figure_formats),
+                dpi=spec.get("dpi", figure_dpi),
+                bbox_inches=spec.get("bbox_inches", "tight"),
+            )
+            figure_paths[name] = [str(path) for path in paths]
+        else:
+            figure_paths[name] = save_notebook02_figures(
+                {name: figure},
+                dirs.get("figures_final", dirs["figures"]),
+                formats=tuple(spec.get("formats", figure_formats)),
+                dpi=int(spec.get("dpi", figure_dpi)),
+            )[name]
+    preview_figure_paths: dict[str, list[str]] = {}
+    if save_preview_figures:
+        target_dir = dirs.get("figures_preview", dirs.get("figures", dirs["output"] / "figures_preview"))
+        preview_figure_paths = save_notebook02_figures(
+            preview_figures or {},
+            target_dir,
+            formats=("png",),
+            dpi=150,
+        )
     config_path = write_json(dirs["configs"] / "simple_quant_v2_config.json", dict(config or {}))
     manifest = {
         "workflow": "simple_quant_v2",
         "output_dir": str(dirs["output"]),
+        "stage_name": "02_simple_quant",
+        "builder_script": "scripts/build_02_simple_quant_notebook.py",
+        "notebook_name": "02_Simple_quantitative_spacing_analysis.ipynb",
+        "session_source": (config or {}).get("session_source", "01_final_curated"),
         "tables": table_paths,
         "figures": figure_paths,
+        "preview_figures": preview_figure_paths,
         "configs": {"simple_quant_v2_config": str(config_path)},
     }
-    manifest_path = write_json(dirs["output"] / "manifest.json", manifest)
     session.annotations["simple_quant_v2"] = {
         "output_dir": str(dirs["output"]),
         "tables": table_paths,
         "config": str(config_path),
     }
     session.set_stage("simple_quant_v2")
-    checkpoint_path = session.save_pickle(dirs["session"] / "02_simple_quant_session.pkl")
-    manifest["manifest"] = str(manifest_path)
+    checkpoint_path = session.save_pickle(dirs["session"] / "02_simple_quant.pkl")
+    manifest["session_checkpoint"] = str(checkpoint_path)
+    manifest["session_paths"] = {"stage_local": str(checkpoint_path)}
+    if workspace is not None:
+        stage_path = save_stage_session(session, workspace, "02_simple_quant", update_active=True)
+        manifest["session_paths"]["workspace_stage"] = str(stage_path)
+        manifest_paths = write_stage_manifest(workspace, "02_simple_quant", manifest)
+        collect_project_manifest(workspace)
+        manifest["manifest"] = str(manifest_paths["stage_manifest"])
+        manifest["workspace_manifest"] = str(manifest_paths["workspace_manifest"])
+    else:
+        manifest_path = write_json(dirs["output"] / "manifest.json", manifest)
+        manifest["manifest"] = str(manifest_path)
     manifest["session_checkpoint"] = str(checkpoint_path)
     return manifest
 
@@ -1381,6 +1543,7 @@ def save_final_checkpoint_if_requested(
     result_root: str | Path,
     filename: str,
     enabled: bool,
+    workspace: AnalysisWorkspace | None = None,
 ) -> NotebookResult:
     if session is None:
         return NotebookResult(messages=["No session yet; run the main workflow stages first."])
@@ -1390,7 +1553,12 @@ def save_final_checkpoint_if_requested(
             messages=[f"Current stage is {session.current_stage!r}; finish refinement/curation first."],
         )
     if enabled:
-        checkpoint_path = save_checkpoint(session, result_root, filename)
+        if workspace is not None:
+            checkpoint_dir = stage_output_dirs(workspace, "01_findatom")["stage"] / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = session.save_pickle(checkpoint_dir / filename)
+        else:
+            checkpoint_path = save_checkpoint(session, result_root, filename)
         return NotebookResult(session=session, messages=[f"Final checkpoint saved: {checkpoint_path}"])
     return NotebookResult(
         session=session,
@@ -1694,16 +1862,31 @@ def _write_excel_workbook(output_path: Path, sheets: dict[str, pd.DataFrame]) ->
 def export_final_atom_table_excel(
     session: AnalysisSession | None,
     *,
-    result_root: str | Path,
-    filename: str = "01_final_atom_columns.xlsx",
+    result_root: str | Path | None = None,
+    workspace: AnalysisWorkspace | None = None,
+    session_source: str = "01_final_curated",
+    session_path: str | Path | None = None,
+    filename: str = "final_atom_columns.xlsx",
     kept_only_sheet: bool = True,
+    save_csv: bool = True,
 ) -> NotebookResult:
+    if session is None and workspace is not None:
+        session = load_stage_session(workspace, session_source, session_path=session_path, required_stage=None)
+    elif session is None and session_path is not None:
+        from .session import AnalysisSession as _AnalysisSession
+
+        session = _AnalysisSession.load_pickle(session_path)
     if session is None:
         raise RuntimeError("No session is loaded. Load the active session first or run the previous 01 notebook stages.")
     if session.curated_points is None or session.curated_points.empty:
         raise RuntimeError("curated_points is empty. Run the final curation stage before exporting Excel.")
 
-    output_dir = Path(result_root) / "01_findatom" / "tables"
+    if workspace is not None:
+        output_dir = stage_output_dirs(workspace, "01_findatom")["tables"]
+    elif result_root is not None:
+        output_dir = Path(result_root) / "01_findatom" / "tables"
+    else:
+        raise ValueError("result_root is required when workspace is not provided.")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
 
@@ -1739,11 +1922,37 @@ def export_final_atom_table_excel(
         }
     )
     writer_engine = _write_excel_workbook(output_path, sheets)
+    csv_path: Path | None = None
+    if save_csv:
+        csv_path = output_dir / "final_atom_columns.csv"
+        all_points.to_csv(csv_path, index=False)
+    if workspace is not None:
+        manifest = {
+            "workflow": "findatom_final_atom_export",
+            "stage_name": "01_findatom",
+            "builder_script": "scripts/build_01_findatom_notebook.py",
+            "notebook_name": "01_Findatom.ipynb",
+            "session_source": session_source,
+            "tables": {
+                "final_atom_columns_xlsx": str(output_path),
+                **({"final_atom_columns_csv": str(csv_path)} if csv_path is not None else {}),
+            },
+            "figures": {},
+            "configs": {},
+            "session_paths": {"source": str(stage_session_path(workspace, session_source)) if session_path is None else str(session_path)},
+        }
+        manifest_paths = write_stage_manifest(workspace, "01_findatom", manifest)
+        collect_project_manifest(workspace)
 
+    messages = [f"Final atom Excel exported: {output_path}", f"Excel writer: {writer_engine}"]
+    if csv_path is not None:
+        messages.append(f"Final atom CSV exported: {csv_path}")
+    if workspace is not None:
+        messages.append(f"01 manifest updated: {manifest_paths['stage_manifest']}")
     return NotebookResult(
         session=session,
         tables=[metadata, class_summary, flag_summary],
-        messages=[f"Final atom Excel exported: {output_path}", f"Excel writer: {writer_engine}"],
+        messages=messages,
     )
 
 
@@ -1962,6 +2171,7 @@ def save_notebook02_figures(
     *,
     formats: tuple[str, ...] = ("png", "pdf"),
     dpi: int = 600,
+    bbox_inches: str = "tight",
 ) -> dict[str, list[str]]:
     target_dir = Path(figures_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1972,7 +2182,7 @@ def save_notebook02_figures(
         paths: list[str] = []
         for fmt in formats:
             target = target_dir / f"{stem}.{str(fmt).lstrip('.')}"
-            figure.savefig(target, bbox_inches="tight", dpi=int(dpi))
+            figure.savefig(target, bbox_inches=bbox_inches, dpi=int(dpi))
             paths.append(str(target))
         saved[str(stem)] = paths
     return saved
@@ -1984,8 +2194,14 @@ def export_notebook02_results(
     output_dirs: dict[str, Path],
     tables: dict[str, pd.DataFrame | None],
     figures: dict[str, Any] | None = None,
+    preview_figures: dict[str, Any] | None = None,
     configs: dict[str, Any] | None = None,
     excel_exports: dict[str, Any] | None = None,
+    workspace: AnalysisWorkspace | None = None,
+    session_source: str = "01_final_curated",
+    save_preview_figures: bool = False,
+    save_final_figures: bool = True,
+    final_figure_specs: dict[str, Any] | None = None,
     figure_formats: tuple[str, ...] = ("png", "pdf"),
     figure_dpi: int = 600,
 ) -> dict[str, Any]:
@@ -1997,25 +2213,51 @@ def export_notebook02_results(
         target.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(target, index=False)
         table_paths[str(name)] = str(target)
-    figure_paths = save_notebook02_figures(
-        figures or {},
-        output_dirs["figures"],
-        formats=tuple(figure_formats),
-        dpi=int(figure_dpi),
-    )
+    figure_paths: dict[str, list[str]] = {}
+    if save_final_figures:
+        for name, figure in (figures or {}).items():
+            spec = normalize_figure_spec((final_figure_specs or {}).get(name, {}), name=name)
+            if not spec["save"] or figure is None:
+                continue
+            if spec.get("title") is not None and getattr(figure, "axes", None):
+                figure.axes[0].set_title(str(spec["title"]) if spec.get("show_title", True) else "")
+            elif spec.get("show_title", True) is False and getattr(figure, "axes", None):
+                for axis in figure.axes:
+                    axis.set_title("")
+            apply_figure_text_style(figure, spec)
+            target_dir = output_dirs.get("figures_final", output_dirs["figures"])
+            figure_paths[name] = save_notebook02_figures(
+                {name: figure},
+                target_dir,
+                formats=tuple(spec.get("formats", figure_formats)),
+                dpi=int(spec.get("dpi", figure_dpi)),
+                bbox_inches=str(spec.get("bbox_inches", "tight")),
+            )[name]
+    preview_figure_paths: dict[str, list[str]] = {}
+    if save_preview_figures:
+        preview_figure_paths = save_notebook02_figures(
+            preview_figures or {},
+            output_dirs.get("figures_preview", output_dirs["figures"]),
+            formats=("png",),
+            dpi=150,
+        )
     config_paths: dict[str, str] = {}
     for name, payload in (configs or {}).items():
         path = write_json(output_dirs["configs"] / f"{name}.json", payload if isinstance(payload, dict) else {"value": payload})
         config_paths[str(name)] = str(path)
     manifest = {
         "workflow": "simple_quant_v2_task_notebook02",
+        "stage_name": "02_simple_quant",
+        "builder_script": "scripts/build_02_simple_quant_notebook.py",
+        "notebook_name": "02_Simple_quantitative_spacing_analysis.ipynb",
+        "session_source": session_source,
         "output_dir": str(output_dirs["output"]),
         "tables": table_paths,
         "figures": figure_paths,
+        "preview_figures": preview_figure_paths,
         "configs": config_paths,
         "excel_exports": excel_exports or {},
     }
-    manifest_path = write_json(output_dirs["output"] / "manifest.json", manifest)
     session.annotations["notebook02_task_quant"] = {
         "output_dir": str(output_dirs["output"]),
         "tables": table_paths,
@@ -2024,9 +2266,19 @@ def export_notebook02_results(
         "excel_exports": excel_exports or {},
     }
     session.set_stage("simple_quant_v2")
-    checkpoint_path = session.save_pickle(output_dirs["session"] / "02_simple_quant_session.pkl")
-    manifest["manifest"] = str(manifest_path)
+    checkpoint_path = session.save_pickle(output_dirs["session"] / "02_simple_quant.pkl")
     manifest["session_checkpoint"] = str(checkpoint_path)
+    manifest["session_paths"] = {"stage_local": str(checkpoint_path)}
+    if workspace is not None:
+        stage_path = save_stage_session(session, workspace, "02_simple_quant", update_active=True)
+        manifest["session_paths"]["workspace_stage"] = str(stage_path)
+        manifest_paths = write_stage_manifest(workspace, "02_simple_quant", manifest)
+        collect_project_manifest(workspace)
+        manifest["manifest"] = str(manifest_paths["stage_manifest"])
+        manifest["workspace_manifest"] = str(manifest_paths["workspace_manifest"])
+    else:
+        manifest_path = write_json(output_dirs["output"] / "manifest.json", manifest)
+        manifest["manifest"] = str(manifest_path)
     return manifest
 
 
@@ -2036,8 +2288,14 @@ def export_notebook03_results(
     output_dirs: dict[str, Path],
     tables: dict[str, pd.DataFrame | None],
     figures: dict[str, Any] | None = None,
+    preview_figures: dict[str, Any] | None = None,
     configs: dict[str, Any] | None = None,
     excel_exports: dict[str, Any] | None = None,
+    workspace: AnalysisWorkspace | None = None,
+    session_source: str = "01_final_curated",
+    save_preview_figures: bool = False,
+    save_final_figures: bool = True,
+    final_figure_specs: dict[str, Any] | None = None,
     figure_formats: tuple[str, ...] = ("png", "pdf"),
     figure_dpi: int = 600,
 ) -> dict[str, Any]:
@@ -2049,25 +2307,51 @@ def export_notebook03_results(
         target.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(target, index=False)
         table_paths[str(name)] = str(target)
-    figure_paths = save_notebook02_figures(
-        figures or {},
-        output_dirs["figures"],
-        formats=tuple(figure_formats),
-        dpi=int(figure_dpi),
-    )
+    figure_paths: dict[str, list[str]] = {}
+    if save_final_figures:
+        for name, figure in (figures or {}).items():
+            spec = normalize_figure_spec((final_figure_specs or {}).get(name, {}), name=name)
+            if not spec["save"] or figure is None:
+                continue
+            if spec.get("title") is not None and getattr(figure, "axes", None):
+                figure.axes[0].set_title(str(spec["title"]) if spec.get("show_title", True) else "")
+            elif spec.get("show_title", True) is False and getattr(figure, "axes", None):
+                for axis in figure.axes:
+                    axis.set_title("")
+            apply_figure_text_style(figure, spec)
+            target_dir = output_dirs.get("figures_final", output_dirs["figures"])
+            figure_paths[name] = save_notebook02_figures(
+                {name: figure},
+                target_dir,
+                formats=tuple(spec.get("formats", figure_formats)),
+                dpi=int(spec.get("dpi", figure_dpi)),
+                bbox_inches=str(spec.get("bbox_inches", "tight")),
+            )[name]
+    preview_figure_paths: dict[str, list[str]] = {}
+    if save_preview_figures:
+        preview_figure_paths = save_notebook02_figures(
+            preview_figures or {},
+            output_dirs.get("figures_preview", output_dirs["figures"]),
+            formats=("png",),
+            dpi=150,
+        )
     config_paths: dict[str, str] = {}
     for name, payload in (configs or {}).items():
         path = write_json(output_dirs["configs"] / f"{name}.json", payload if isinstance(payload, dict) else {"value": payload})
         config_paths[str(name)] = str(path)
     manifest = {
         "workflow": "cropped_group_centroid_notebook03",
+        "stage_name": "03_group_centroid",
+        "builder_script": "scripts/build_03_cropped_group_centroid_notebook.py",
+        "notebook_name": "03_Cropped_group_centroid_analysis.ipynb",
+        "session_source": session_source,
         "output_dir": str(output_dirs["output"]),
         "tables": table_paths,
         "figures": figure_paths,
+        "preview_figures": preview_figure_paths,
         "configs": config_paths,
         "excel_exports": excel_exports or {},
     }
-    manifest_path = write_json(output_dirs["output"] / "manifest.json", manifest)
     session.annotations["notebook03_cropped_group_centroid"] = {
         "output_dir": str(output_dirs["output"]),
         "tables": table_paths,
@@ -2075,10 +2359,20 @@ def export_notebook03_results(
         "configs": config_paths,
         "excel_exports": excel_exports or {},
     }
-    session.set_stage("cropped_group_centroid")
-    checkpoint_path = session.save_pickle(output_dirs["session"] / "03_cropped_group_centroid_session.pkl")
-    manifest["manifest"] = str(manifest_path)
+    session.set_stage("group_centroid")
+    checkpoint_path = session.save_pickle(output_dirs["session"] / "03_group_centroid.pkl")
     manifest["session_checkpoint"] = str(checkpoint_path)
+    manifest["session_paths"] = {"stage_local": str(checkpoint_path)}
+    if workspace is not None:
+        stage_path = save_stage_session(session, workspace, "03_group_centroid", update_active=True)
+        manifest["session_paths"]["workspace_stage"] = str(stage_path)
+        manifest_paths = write_stage_manifest(workspace, "03_group_centroid", manifest)
+        collect_project_manifest(workspace)
+        manifest["manifest"] = str(manifest_paths["stage_manifest"])
+        manifest["workspace_manifest"] = str(manifest_paths["workspace_manifest"])
+    else:
+        manifest_path = write_json(output_dirs["output"] / "manifest.json", manifest)
+        manifest["manifest"] = str(manifest_path)
     return manifest
 
 

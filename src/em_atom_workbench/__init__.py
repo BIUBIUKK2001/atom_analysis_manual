@@ -319,12 +319,42 @@ __all__ = [
     "vector_field_from_point_matches",
 ]
 
+from .figure_config import FigureExportSpec, apply_figure_text_style, normalize_figure_spec
 from .utils import load_or_connect_session, save_active_session, save_checkpoint
+from .workspace import (
+    AnalysisWorkspace,
+    collect_project_manifest,
+    export_stage_figure,
+    export_stage_table,
+    get_stage_dir,
+    get_stage_subdir,
+    initialize_analysis_workspace,
+    load_active_workspace_session,
+    load_stage_session,
+    save_stage_session,
+    stage_session_path,
+    write_stage_manifest,
+)
 
 __all__.extend(
     [
+        "AnalysisWorkspace",
+        "FigureExportSpec",
+        "apply_figure_text_style",
+        "collect_project_manifest",
+        "export_stage_figure",
+        "export_stage_table",
+        "get_stage_dir",
+        "get_stage_subdir",
+        "initialize_analysis_workspace",
+        "load_active_workspace_session",
+        "load_stage_session",
         "load_or_connect_session",
+        "normalize_figure_spec",
         "save_active_session",
         "save_checkpoint",
+        "save_stage_session",
+        "stage_session_path",
+        "write_stage_manifest",
     ]
 )

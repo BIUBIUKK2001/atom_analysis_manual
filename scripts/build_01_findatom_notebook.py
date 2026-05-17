@@ -111,6 +111,54 @@ CANDIDATE_REVIEW_POINT_SIZE = 6.0
         by_id["title"],
         by_id["imports"],
         md(
+            "workspace-parameters-md",
+            """
+## 0. Workspace parameters
+
+这一格只定义当前 dataset/run 的统一输出 workspace。01、02、03 都应使用同一组 `OUTPUT_ROOT / DATASET_ID / ANALYSIS_ID`，这样 session、tables、figures、configs 和 manifest 会稳定写入同一个分析目录。
+""",
+        ),
+        code(
+            "workspace-parameters",
+            """
+# =========================
+# 0. Workspace parameters
+# =========================
+# OUTPUT_ROOT：所有 dataset / analysis run 的根目录。
+# 建议设置为固定科研输出目录，例如 Path('D:/analysis_outputs')。
+OUTPUT_ROOT = PROJECT_ROOT / 'results'
+
+# DATASET_ID：当前正在分析的数据名。
+# 建议包含样品名、区域号或文件名，不要使用过长路径。
+DATASET_ID = 'dataset_001'
+
+# ANALYSIS_ID：当前这次分析的版本名。
+# 同一个 dataset 可有多个 analysis_id，例如 run_001, run_002, parameter_test_01。
+ANALYSIS_ID = 'run_001'
+
+workspace = initialize_analysis_workspace(
+    output_root=OUTPUT_ROOT,
+    dataset_id=DATASET_ID,
+    analysis_id=ANALYSIS_ID,
+)
+
+# 为兼容旧 wrapper，RESULT_ROOT 仍然存在；新流程中它指向当前 workspace.root。
+RESULT_ROOT = workspace.root
+
+# 预览图和正式图在 workspace 中分开管理：
+# figures_preview/ 用于可选调参预览，figures_final/ 用于正式导出图。
+
+# SAVE_STAGE_SESSIONS=True 时，每个关键阶段都会覆盖对应 canonical stage session，
+# 并更新 workspace/state/active_session.pkl 与 workspace/state/latest_session.json。
+SAVE_STAGE_SESSIONS = True
+
+session = globals().get('session')
+active_path = workspace.state_dir / 'active_session.pkl'
+print(f'workspace: {workspace.root}')
+print(f'active session: {active_path}')
+""",
+        ),
+        md(
             "channel-parameters-md",
             """
 ## 1. 通道输入参数
@@ -177,6 +225,10 @@ result = review_generic_candidates(
 session = result.session or session
 if result.active_path is not None:
     active_path = result.active_path
+if SAVE_STAGE_SESSIONS and session is not None:
+    stage_path = save_stage_session(session, workspace, '01_candidate_reviewed', update_active=True)
+    active_path = workspace.state_dir / 'active_session.pkl'
+    print(f'01 candidate-reviewed session: {stage_path}')
 display_notebook_result(result)
 """,
         ),
@@ -324,7 +376,11 @@ EXPORT_FINAL_EXCEL = True
 
 # FINAL_EXCEL_FILENAME：输出到 RESULT_ROOT / '01_findatom' / 'tables' 下的文件名。
 # Excel 内包含 all_curated_points、kept_points、class_summary、flag_summary、metadata。
-FINAL_EXCEL_FILENAME = '01_final_atom_columns.xlsx'
+FINAL_EXCEL_FILENAME = 'final_atom_columns.xlsx'
+
+# SESSION_SOURCE_FOR_EXCEL：默认读取 workspace/state/sessions/01_final_curated.pkl。
+# 如果要读取旧 results/_active_session.pkl 或手动 checkpoint，请设置 CHECKPOINT_PATH。
+SESSION_SOURCE_FOR_EXCEL = '01_final_curated'
 
 from pathlib import Path
 import sys
@@ -339,23 +395,33 @@ for _module_name in list(sys.modules):
     if _module_name == 'em_atom_workbench' or _module_name.startswith('em_atom_workbench.'):
         sys.modules.pop(_module_name, None)
 
+from em_atom_workbench import initialize_analysis_workspace, load_stage_session
 from em_atom_workbench.session import AnalysisSession
 from em_atom_workbench.notebook_workflows import display_notebook_result, export_final_atom_table_excel
 
-RESULT_ROOT = _project_root / 'results'
+OUTPUT_ROOT = globals().get('OUTPUT_ROOT', _project_root / 'results')
+DATASET_ID = globals().get('DATASET_ID', 'dataset_001')
+ANALYSIS_ID = globals().get('ANALYSIS_ID', 'run_001')
+workspace = globals().get('workspace') or initialize_analysis_workspace(OUTPUT_ROOT, DATASET_ID, ANALYSIS_ID)
+RESULT_ROOT = workspace.root
 
-# CHECKPOINT_PATH：最终 checkpoint 路径。
-# 如果当前 kernel 丢了变量，直接填这里，然后只运行本 cell 即可导出。
+# CHECKPOINT_PATH：可选手动 session pickle 路径。
+# 默认 None 时读取 workspace/state/sessions/01_final_curated.pkl。
+# 旧 results/_active_session.pkl 也可以手动填到这里作为兼容入口。
 CHECKPOINT_PATH = None
 
 if EXPORT_FINAL_EXCEL:
     if CHECKPOINT_PATH is None:
-        raise ValueError('Please set CHECKPOINT_PATH to your saved final checkpoint .pkl file.')
-    session = AnalysisSession.load_pickle(CHECKPOINT_PATH)
+        session = load_stage_session(workspace, SESSION_SOURCE_FOR_EXCEL, required_stage=None)
+    else:
+        session = AnalysisSession.load_pickle(CHECKPOINT_PATH)
     result = export_final_atom_table_excel(
         session,
-        result_root=RESULT_ROOT,
+        workspace=workspace,
+        session_source=SESSION_SOURCE_FOR_EXCEL,
+        session_path=CHECKPOINT_PATH,
         filename=FINAL_EXCEL_FILENAME,
+        save_csv=True,
     )
     display_notebook_result(result)
 else:
@@ -411,7 +477,11 @@ from em_atom_workbench import (
     DetectionConfig,
     PixelCalibration,
     RefinementConfig,
+    initialize_analysis_workspace,
+    load_active_workspace_session,
+    load_stage_session,
     save_checkpoint,
+    save_stage_session,
     load_or_connect_session,
 )
 from em_atom_workbench.plotting import launch_refinement_napari_viewer
@@ -432,10 +502,8 @@ plt.rcParams['figure.dpi'] = 140
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Noto Sans CJK SC', 'Arial Unicode MS', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
-RESULT_ROOT = PROJECT_ROOT / 'results'
-RESULT_ROOT.mkdir(exist_ok=True)
 session = None
-active_path = RESULT_ROOT / '_active_session.pkl'
+active_path = None
 """,
         ),
         md(
@@ -756,6 +824,10 @@ result = initialize_generic_classification_session(
 )
 session = result.session
 active_path = result.active_path
+if SAVE_STAGE_SESSIONS:
+    stage_path = save_stage_session(session, workspace, '01_loaded', update_active=True)
+    active_path = workspace.state_dir / 'active_session.pkl'
+    print(f'01 loaded session: {stage_path}')
 display_notebook_result(result)
 """,
         ),
@@ -802,6 +874,10 @@ result = run_generic_refinement(
 )
 session = result.session
 active_path = result.active_path
+if SAVE_STAGE_SESSIONS:
+    stage_path = save_stage_session(session, workspace, '01_refined', update_active=True)
+    active_path = workspace.state_dir / 'active_session.pkl'
+    print(f'01 refined session: {stage_path}')
 display_notebook_result(result)
 """,
         ),
@@ -854,7 +930,9 @@ active_path = result.active_path
 display_notebook_result(result)
 
 if SAVE_CLASSIFIED_CHECKPOINT and session.current_stage == 'classified':
-    checkpoint_path = save_checkpoint(session, RESULT_ROOT, CLASSIFIED_CHECKPOINT_FILENAME)
+    checkpoint_dir = workspace.stage_dirs['01_findatom'] / 'checkpoints'
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = session.save_pickle(checkpoint_dir / CLASSIFIED_CHECKPOINT_FILENAME)
     print(f'已保存分类 checkpoint: {checkpoint_path}')
 """,
         ),
@@ -880,6 +958,10 @@ result = show_atom_column_class_review(
 session = result.session or session
 if result.active_path is not None:
     active_path = result.active_path
+if SAVE_STAGE_SESSIONS and session is not None:
+    stage_path = save_stage_session(session, workspace, '01_class_reviewed', update_active=True)
+    active_path = workspace.state_dir / 'active_session.pkl'
+    print(f'01 class-reviewed session: {stage_path}')
 display_notebook_result(result)
 """,
         ),
@@ -901,6 +983,10 @@ result = run_generic_curation(
 )
 session = result.session
 active_path = result.active_path
+if SAVE_STAGE_SESSIONS:
+    stage_path = save_stage_session(session, workspace, '01_final_curated', update_active=True)
+    active_path = workspace.state_dir / 'active_session.pkl'
+    print(f'01 final curated session: {stage_path}')
 display_notebook_result(result)
 """,
         ),
@@ -920,6 +1006,7 @@ result = save_final_checkpoint_if_requested(
     result_root=RESULT_ROOT,
     filename=FINAL_CHECKPOINT_FILENAME,
     enabled=SAVE_FINAL_CHECKPOINT,
+    workspace=workspace,
 )
 display_notebook_result(result)
 """,
@@ -940,19 +1027,18 @@ import importlib
 from pathlib import Path
 import matplotlib.pyplot as plt
 from IPython.display import display
-from em_atom_workbench.utils import load_or_connect_session
+from em_atom_workbench import load_active_workspace_session, load_stage_session
 import em_atom_workbench.plotting as plotting_nm
 
 # 不重启 kernel：只刷新绘图模块，让本格使用最新的 nm 坐标轴逻辑。
 plotting_nm = importlib.reload(plotting_nm)
 
 if globals().get('session') is None:
-    candidate_active_path = globals().get('active_path')
-    candidate_active_path = Path(candidate_active_path) if candidate_active_path else None
-    session = load_or_connect_session(
-        RESULT_ROOT,
-        session_path=candidate_active_path if candidate_active_path and candidate_active_path.exists() else None,
-    )
+    candidate_active_path = workspace.state_dir / 'active_session.pkl'
+    if candidate_active_path.exists():
+        session = load_active_workspace_session(workspace)
+    else:
+        session = load_stage_session(workspace, '01_final_curated', required_stage=None)
 
 calibration = session.pixel_calibration
 nm_axis_kwargs = {'pixel_size': calibration.size, 'unit': calibration.unit, 'target_unit': 'nm'}

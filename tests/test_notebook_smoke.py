@@ -89,6 +89,7 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
     assert "parameter-notes" not in cell_ids
     expected_order = [
         "imports",
+        "workspace-parameters",
         "channel-parameters",
         "load-session",
         "detect-parameters",
@@ -114,6 +115,7 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
     )
 
     for parameter_id, stage_id in (
+        ("workspace-parameters", "channel-parameters"),
         ("channel-parameters", "load-session"),
         ("detect-parameters", "detect-stage"),
         ("candidate-review-parameters", "candidate-review-stage"),
@@ -125,6 +127,14 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
     ):
         _assert_parameter_cell_before_stage(cell_ids, parameter_id, stage_id)
 
+    assert "OUTPUT_ROOT" in source_by_id["workspace-parameters"]
+    assert "DATASET_ID" in source_by_id["workspace-parameters"]
+    assert "ANALYSIS_ID" in source_by_id["workspace-parameters"]
+    assert "workspace" in source_by_id["workspace-parameters"]
+    assert "SAVE_STAGE_SESSIONS" in source_by_id["workspace-parameters"]
+    assert "01_final_curated" in joined
+    assert "figures_preview" in joined
+    assert "figures_final" in joined
     assert "CHANNELS" in source_by_id["channel-parameters"]
     assert "DETECTION_CONFIGS_BY_CHANNEL" in source_by_id["detect-parameters"]
     assert "OPEN_CANDIDATE_REVIEW_VIEWER" in source_by_id["candidate-review-parameters"]
@@ -213,7 +223,7 @@ def test_export_final_atom_table_excel_writes_xlsx(tmp_path: Path) -> None:
     )
 
     result = export_final_atom_table_excel(session, result_root=tmp_path)
-    output_path = tmp_path / "01_findatom" / "tables" / "01_final_atom_columns.xlsx"
+    output_path = tmp_path / "01_findatom" / "tables" / "final_atom_columns.xlsx"
 
     assert output_path.exists()
     assert any("Final atom Excel exported" in message for message in result.messages)

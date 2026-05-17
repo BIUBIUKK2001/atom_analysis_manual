@@ -27,6 +27,10 @@ STAGE_ORDER = {
     "metrics": 8,
     "annotated": 9,
     "vector_field": 10,
+    "simple_quant": 11,
+    "simple_quant_v2": 12,
+    "group_centroid": 13,
+    "cropped_group_centroid": 13,
 }
 
 

@@ -74,6 +74,7 @@ from em_atom_workbench import (
     plot_cropped_group_centers_and_displacements,
     summarize_rois_and_points,
     transform_rois_xy,
+    initialize_analysis_workspace,
 )
 from em_atom_workbench.notebook_workflows import (
     cropped_group_centroid_output_dirs,
@@ -104,24 +105,52 @@ def rois_to_table(local_rois, global_rois=None):
 """,
         ),
         md(
+            "workspace-md",
+            """
+## 0. Workspace parameters
+
+这一格只定义当前 dataset/run 的统一 workspace。03 默认从 `workspace/state/sessions/01_final_curated.pkl` 读取 01 的最终 curated session，并把所有 03 输出写入 canonical `03_group_centroid/`。
+""",
+        ),
+        code(
+            "workspace-parameters",
+            """
+OUTPUT_ROOT = PROJECT_ROOT / 'results'
+DATASET_ID = 'dataset_001'
+ANALYSIS_ID = 'run_001'
+
+workspace = initialize_analysis_workspace(
+    output_root=OUTPUT_ROOT,
+    dataset_id=DATASET_ID,
+    analysis_id=ANALYSIS_ID,
+)
+
+# 为兼容旧 wrapper，RESULT_ROOT 仍然存在；新流程中它指向当前 workspace.root。
+RESULT_ROOT = workspace.root
+
+# SESSION_SOURCE='01_final_curated' 是推荐默认入口：
+# workspace/state/sessions/01_final_curated.pkl
+SESSION_SOURCE = '01_final_curated'
+
+# SESSION_PATH=None 时读取 SESSION_SOURCE。
+# 如需读取旧 results/_active_session.pkl 或手动 checkpoint，可在这里填 pickle 路径。
+SESSION_PATH = None
+
+print(f'workspace: {workspace.root}')
+print(f'default session: {workspace.sessions_dir / (SESSION_SOURCE + ".pkl")}')
+""",
+        ),
+        md(
             "load-md",
             """
-## 0. Load 01 session / image / atom table
+## 1. Load 01 session / image / atom table
 
-这里和 02 一样读取 01 保存的 active session，并选择 `SOURCE_TABLE`、`USE_KEEP_ONLY`、`IMAGE_CHANNEL` 和 `IMAGE_KEY`。03 的正式图必须有真实 nm scalebar，所以没有 pixel calibration 时会直接停止。
+这里和 02 一样读取 01 保存的 `01_final_curated` stage session，并选择 `SOURCE_TABLE`、`USE_KEEP_ONLY`、`IMAGE_CHANNEL` 和 `IMAGE_KEY`。03 的正式图必须有真实 nm scalebar，所以没有 pixel calibration 时会直接停止。
 """,
         ),
         code(
             "load-session",
             """
-RESULT_ROOT = PROJECT_ROOT / 'results'
-RESULT_ROOT.mkdir(exist_ok=True)
-
-# SESSION_PATH：
-# - None：读取 RESULT_ROOT / '_active_session.pkl'；
-# - Path 或字符串：读取你手动指定的 session pickle。
-SESSION_PATH = None
-
 # SOURCE_TABLE：选择 01 产生的哪一张原子坐标表作为分析起点。
 # curated：正式定量推荐；refined：检查精修点；candidate：通常仅用于诊断。
 SOURCE_TABLE = 'curated'
@@ -131,6 +160,9 @@ IMAGE_KEY = 'raw'
 
 context = initialize_simple_quant_v2_analysis(
     session_path=SESSION_PATH,
+    workspace=workspace,
+    session_source=SESSION_SOURCE,
+    required_stage=None,
     result_root=RESULT_ROOT,
     source_table=SOURCE_TABLE,
     use_keep_only=USE_KEEP_ONLY,
@@ -148,7 +180,8 @@ PIXEL_TO_NM = analysis_points_global.attrs.get('pixel_to_nm')
 if PIXEL_TO_NM is None or not np.isfinite(float(PIXEL_TO_NM)) or float(PIXEL_TO_NM) <= 0:
     raise ValueError('03 requires a valid pixel calibration from 01 so the final figure can include a true nm scalebar.')
 
-output_dirs = cropped_group_centroid_output_dirs(RESULT_ROOT)
+output_dirs = cropped_group_centroid_output_dirs(workspace=workspace)
+preview_figures = {}
 figures = {}
 excel_exports = {}
 
@@ -427,6 +460,43 @@ display(cropped_group_excel)
 """,
         ),
         code(
+            "final-figure-export-parameters",
+            """
+# =========================
+# Final figure export parameters
+# =========================
+# preview figures 只用于调参检查；默认不保存；若启用则写入 03_group_centroid/figures_preview。
+SAVE_PREVIEW_FIGURES = False
+
+# final figures 是正式导出的论文/报告候选图，保存到 03_group_centroid/figures_final。
+SAVE_FINAL_FIGURES = True
+
+FIGURE_FORMATS = FIG_STYLE.normalized_formats() if hasattr(FIG_STYLE, 'normalized_formats') else ('pdf', 'png', 'svg')
+FIGURE_DPI = FIG_STYLE.fig_dpi
+FIGURE_FONT_FAMILY = 'Arial'
+FIGURE_FONT_SIZE = 9
+
+FIG_FINAL_TITLE = 'Cropped group-center displacement'
+FIG_SHOW_TITLE = True
+FIG_SHOW_DISTANCE_COLORBAR = SHOW_DISTANCE_COLORBAR
+FIG_SHOW_SCALEBAR = SHOW_SCALEBAR
+
+FINAL_FIGURE_SPECS = {
+    'cropped_group_center_displacement': {
+        'save': True,
+        'title': FIG_FINAL_TITLE,
+        'show_title': FIG_SHOW_TITLE,
+        'show_distance_colorbar': FIG_SHOW_DISTANCE_COLORBAR,
+        'show_scalebar': FIG_SHOW_SCALEBAR,
+        'font_family': FIGURE_FONT_FAMILY,
+        'font_size': FIGURE_FONT_SIZE,
+        'formats': FIGURE_FORMATS,
+        'dpi': FIGURE_DPI,
+    }
+}
+""",
+        ),
+        code(
             "final-export",
             """
 notebook03_tables = {
@@ -440,7 +510,10 @@ notebook03_tables = {
 }
 
 notebook03_configs = {
-    'notebook03_cropped_group_centroid_config': {
+    'notebook03_group_centroid_config': {
+        'dataset_id': DATASET_ID,
+        'analysis_id': ANALYSIS_ID,
+        'session_source': SESSION_SOURCE,
         'source_table': SOURCE_TABLE,
         'use_keep_only': USE_KEEP_ONLY,
         'image_channel': image_channel,
@@ -477,10 +550,16 @@ manifest = export_notebook03_results(
     output_dirs=output_dirs,
     tables=notebook03_tables,
     figures=figures,
+    preview_figures=preview_figures,
     configs=notebook03_configs,
     excel_exports=excel_exports,
-    figure_formats=FIG_STYLE.normalized_formats(),
-    figure_dpi=FIG_STYLE.fig_dpi,
+    workspace=workspace,
+    session_source=SESSION_SOURCE,
+    save_preview_figures=SAVE_PREVIEW_FIGURES,
+    save_final_figures=SAVE_FINAL_FIGURES,
+    final_figure_specs=FINAL_FIGURE_SPECS,
+    figure_formats=FIGURE_FORMATS,
+    figure_dpi=FIGURE_DPI,
 )
 display(manifest)
 """,
