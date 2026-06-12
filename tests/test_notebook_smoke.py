@@ -133,6 +133,14 @@ def test_findatom_notebook_uses_generic_classification_workflow_with_utf8_notes(
     assert "workspace" in source_by_id["workspace-parameters"]
     assert "SAVE_STAGE_SESSIONS" in source_by_id["workspace-parameters"]
     assert "01_final_curated" in joined
+    for stage_session_name in (
+        "01_loaded",
+        "01_candidate_reviewed",
+        "01_class_reviewed",
+        "01_refined",
+        "01_final_curated",
+    ):
+        assert f"save_stage_session(session, workspace, '{stage_session_name}'" in joined
     assert "figures_preview" in joined
     assert "figures_final" in joined
     assert "CHANNELS" in source_by_id["channel-parameters"]

@@ -85,11 +85,13 @@ from .utils import (
     write_json,
 )
 from .figure_config import apply_figure_text_style, normalize_figure_spec
+from .intensity import prepare_disk_intensity_points
 from .workspace import (
     AnalysisWorkspace,
     collect_project_manifest,
     export_stage_figure,
     initialize_analysis_workspace,
+    load_active_workspace_session,
     load_stage_session,
     save_stage_session,
     stage_session_path,
@@ -345,6 +347,30 @@ def cropped_group_centroid_output_dirs(
     return dirs
 
 
+def disk_intensity_output_dirs(
+    workspace: AnalysisWorkspace | None = None,
+    result_root: str | Path | None = None,
+) -> dict[str, Path]:
+    if workspace is not None:
+        dirs = stage_output_dirs(workspace, "04_intensity_mapping")
+        dirs["figures"] = dirs["figures_final"]
+        return dirs
+    output_dir = Path(result_root or "results") / "04_intensity_mapping"
+    dirs = {
+        "stage": output_dir,
+        "output": output_dir,
+        "tables": output_dir / "tables",
+        "figures": output_dir / "figures_final",
+        "figures_preview": output_dir / "figures_preview",
+        "figures_final": output_dir / "figures_final",
+        "configs": output_dir / "configs",
+        "session": output_dir / "session",
+    }
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
 def _resolve_simple_quant_image(
     session: AnalysisSession,
     *,
@@ -361,6 +387,96 @@ def _resolve_simple_quant_image(
     if key == "processed":
         return session.get_processed_image(channel_name), channel_name, key
     raise ValueError("image_key must be 'raw' or 'processed'.")
+
+
+def initialize_disk_intensity_analysis(
+    *,
+    session_path: str | Path | None = None,
+    workspace: AnalysisWorkspace | None = None,
+    session_source: str = "01_final_curated",
+    use_active_session: bool = False,
+    result_root: str | Path | None = None,
+    coordinate_source: str = "refined",
+    use_keep_only: bool = True,
+    class_filter: tuple[str, ...] | list[str] | set[str] | None = None,
+    class_id_filter: tuple[int, ...] | list[int] | set[int] | None = None,
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | None = None,
+    image_channel: str | None = None,
+    image_key: str = "raw",
+) -> dict[str, Any]:
+    if workspace is not None:
+        if session_path is not None:
+            session = load_stage_session(workspace, session_source, session_path=session_path)
+            session_load_mode = "session_path"
+            resolved_session_path = Path(session_path)
+        elif use_active_session:
+            session = load_active_workspace_session(workspace)
+            session_load_mode = "active_session"
+            resolved_session_path = workspace.state_dir / "active_session.pkl"
+        else:
+            session = load_stage_session(workspace, session_source)
+            session_load_mode = "stage_session"
+            resolved_session_path = stage_session_path(workspace, session_source)
+    else:
+        if result_root is None:
+            raise ValueError("result_root is required when workspace is not provided.")
+        session = load_or_connect_session(result_root, session_path=session_path)
+        session_load_mode = "session_path" if session_path is not None else "legacy_active_session"
+        resolved_session_path = Path(session_path) if session_path is not None else Path(result_root) / "_active_session.pkl"
+
+    points = prepare_disk_intensity_points(
+        session,
+        coordinate_source=coordinate_source,
+        use_keep_only=use_keep_only,
+        class_filter=class_filter,
+        class_id_filter=class_id_filter,
+        rois=rois,
+    )
+    image, resolved_channel, resolved_image_key = _resolve_simple_quant_image(
+        session,
+        image_channel=image_channel,
+        image_key=image_key,
+    )
+    output_dirs = disk_intensity_output_dirs(workspace=workspace, result_root=result_root or "results")
+    source_table = str(points.attrs.get("source_table", ""))
+    warnings_out = list(points.attrs.get("warnings", []))
+    summary = pd.DataFrame(
+        [
+            {"field": "session_name", "value": session.name},
+            {"field": "current_stage", "value": session.current_stage},
+            {"field": "session_load_mode", "value": session_load_mode},
+            {"field": "resolved_session_path", "value": str(resolved_session_path)},
+            {"field": "coordinate_source", "value": coordinate_source},
+            {"field": "source_table", "value": source_table},
+            {"field": "image_channel", "value": resolved_channel},
+            {"field": "image_key", "value": resolved_image_key},
+            {"field": "point_rows", "value": len(points)},
+            {"field": "unique_points", "value": points["point_id"].nunique() if "point_id" in points else len(points)},
+            {"field": "roi_count", "value": points["roi_id"].nunique() if "roi_id" in points else 0},
+            {"field": "warnings", "value": "; ".join(warnings_out)},
+            {"field": "output_dir", "value": str(output_dirs["output"])},
+        ]
+    )
+    return {
+        "session": session,
+        "workspace": workspace,
+        "points": points,
+        "image": image,
+        "image_channel": resolved_channel,
+        "image_key": resolved_image_key,
+        "output_dirs": output_dirs,
+        "coordinate_source": coordinate_source,
+        "source_table": source_table,
+        "session_source": session_source,
+        "session_path": None if session_path is None else str(session_path),
+        "use_active_session": bool(use_active_session),
+        "session_load_mode": session_load_mode,
+        "resolved_session_path": str(resolved_session_path),
+        "summary_tables": {
+            "disk_intensity_setup_summary": summary,
+            "points_preview": points.head(),
+        },
+    }
 
 
 def initialize_simple_quant_analysis(
@@ -748,6 +864,126 @@ def export_simple_quant_v2_analysis(
         manifest_path = write_json(dirs["output"] / "manifest.json", manifest)
         manifest["manifest"] = str(manifest_path)
     manifest["session_checkpoint"] = str(checkpoint_path)
+    return manifest
+
+
+def export_disk_intensity_analysis(
+    *,
+    workspace: AnalysisWorkspace | None = None,
+    result_root: str | Path | None = None,
+    session: AnalysisSession | None = None,
+    intensity_table: pd.DataFrame | None = None,
+    summary_table: pd.DataFrame | None = None,
+    config: dict[str, Any] | None = None,
+    preview_figures: dict[str, Any] | None = None,
+    final_figures: dict[str, Any] | None = None,
+    save_preview_figures: bool = False,
+    save_final_figures: bool = True,
+    figure_specs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if session is None:
+        raise ValueError("session is required for export_disk_intensity_analysis.")
+    dirs = disk_intensity_output_dirs(workspace=workspace, result_root=result_root or "results")
+
+    table_paths: dict[str, str] = {}
+    table_payloads = {
+        "disk_intensity_table": intensity_table,
+        "disk_intensity_summary": summary_table,
+    }
+    for name, table in table_payloads.items():
+        if table is None:
+            continue
+        target = dirs["tables"] / f"{name}.csv"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(target, index=False)
+        table_paths[name] = str(target)
+
+    config_payload = dict(config or {})
+    config_path = write_json(dirs["configs"] / "04_disk_intensity_config.json", config_payload)
+
+    preview_figure_paths: dict[str, list[str]] = {}
+    if save_preview_figures:
+        preview_figure_paths = save_notebook02_figures(
+            preview_figures or {},
+            dirs["figures_preview"],
+            formats=("png",),
+            dpi=150,
+        )
+
+    figure_paths: dict[str, list[str]] = {}
+    if save_final_figures:
+        for name, figure in (final_figures or {}).items():
+            if figure is None:
+                continue
+            spec = normalize_figure_spec((figure_specs or {}).get(name, {}), name=name)
+            if not spec["save"]:
+                continue
+            if spec.get("title") is not None and getattr(figure, "axes", None):
+                figure.axes[0].set_title(str(spec["title"]) if spec.get("show_title", True) else "")
+            elif spec.get("show_title", True) is False and getattr(figure, "axes", None):
+                for axis in figure.axes:
+                    axis.set_title("")
+            apply_figure_text_style(figure, spec)
+            if workspace is not None:
+                paths = export_stage_figure(
+                    workspace,
+                    "04_intensity_mapping",
+                    name,
+                    figure,
+                    final=True,
+                    formats=tuple(spec.get("formats", ("pdf", "png", "svg"))),
+                    dpi=int(spec.get("dpi", 600)),
+                    bbox_inches=str(spec.get("bbox_inches", "tight")),
+                )
+                figure_paths[name] = [str(path) for path in paths]
+            else:
+                figure_paths[name] = save_notebook02_figures(
+                    {name: figure},
+                    dirs["figures_final"],
+                    formats=tuple(spec.get("formats", ("pdf", "png", "svg"))),
+                    dpi=int(spec.get("dpi", 600)),
+                    bbox_inches=str(spec.get("bbox_inches", "tight")),
+                )[name]
+
+    manifest = {
+        "workflow": "disk_integrated_intensity_mapping",
+        "stage_name": "04_intensity_mapping",
+        "builder_script": "scripts/build_04_disk_integrated_intensity_notebook.py",
+        "notebook_name": "04_Disk_integrated_intensity_mapping.ipynb",
+        "output_dir": str(dirs["output"]),
+        "session_source": config_payload.get("session_source"),
+        "session_path": config_payload.get("session_path"),
+        "use_active_session": config_payload.get("use_active_session"),
+        "coordinate_source": config_payload.get("coordinate_source"),
+        "source_table": config_payload.get("source_table"),
+        "disk_radius_px": config_payload.get("disk_radius_px"),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "preview_figures": preview_figure_paths,
+        "configs": {"04_disk_intensity_config": str(config_path)},
+    }
+    session.annotations["disk_integrated_intensity_mapping"] = {
+        "output_dir": str(dirs["output"]),
+        "tables": table_paths,
+        "figures": figure_paths,
+        "config": str(config_path),
+        "coordinate_source": config_payload.get("coordinate_source"),
+    }
+    session.set_stage("04_intensity_mapping")
+    checkpoint_path = session.save_pickle(dirs["session"] / "04_intensity_mapping.pkl")
+    manifest["session_checkpoint"] = str(checkpoint_path)
+    manifest["session_paths"] = {"stage_local": str(checkpoint_path)}
+    if workspace is not None:
+        stage_path = save_stage_session(session, workspace, "04_intensity_mapping", update_active=True)
+        manifest["session_paths"]["workspace_stage"] = str(stage_path)
+        manifest["session_paths"]["active_session"] = str(workspace.state_dir / "active_session.pkl")
+        manifest_paths = write_stage_manifest(workspace, "04_intensity_mapping", manifest)
+        collect_project_manifest(workspace)
+        manifest["manifest"] = str(manifest_paths["stage_manifest"])
+        manifest["workspace_manifest"] = str(manifest_paths["workspace_manifest"])
+    else:
+        manifest_path = write_json(dirs["output"] / "manifest.json", manifest)
+        manifest["manifest"] = str(manifest_path)
     return manifest
 
 

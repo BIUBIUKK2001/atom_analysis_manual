@@ -7,6 +7,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from em_atom_workbench.notebook_workflows import (
+    cropped_group_centroid_output_dirs,
+    disk_intensity_output_dirs,
+    export_disk_intensity_analysis,
+    export_notebook03_results,
+    export_simple_quant_v2_analysis,
+    initialize_simple_quant_v2_analysis,
+    simple_quant_output_dirs,
+)
 from em_atom_workbench.session import AnalysisSession, PixelCalibration
 from em_atom_workbench.workspace import (
     collect_project_manifest,
@@ -27,7 +36,7 @@ def test_initialize_analysis_workspace_creates_expected_dirs(tmp_path: Path) -> 
     assert (workspace.root / "state" / "sessions").is_dir()
     assert (workspace.root / "shared").is_dir()
     assert (workspace.root / "manifests").is_dir()
-    for stage_name in ("01_findatom", "02_simple_quant", "03_group_centroid"):
+    for stage_name in ("01_findatom", "02_simple_quant", "03_group_centroid", "04_intensity_mapping"):
         assert (workspace.root / stage_name).is_dir()
         assert (workspace.root / stage_name / "configs").is_dir()
         assert (workspace.root / stage_name / "tables").is_dir()
@@ -142,3 +151,125 @@ def test_save_stage_session_updates_shared_files(tmp_path: Path) -> None:
     assert "channel" in channel_summary.columns
     assert pixel_payload["size"] == 0.02
     assert pixel_payload["unit"] == "nm"
+
+
+def test_initialize_simple_quant_v2_analysis_loads_workspace_stage_session(tmp_path: Path) -> None:
+    workspace = initialize_analysis_workspace(tmp_path, "dataset", "run")
+    session = AnalysisSession(name="curated", raw_image=np.zeros((8, 8), dtype=float))
+    session.curated_points = pd.DataFrame(
+        {
+            "atom_id": [0, 1],
+            "x_px": [2.0, 5.0],
+            "y_px": [3.0, 6.0],
+            "keep": [True, True],
+        }
+    )
+    session.set_stage("curated")
+    save_stage_session(session, workspace, "01_final_curated")
+
+    context = initialize_simple_quant_v2_analysis(
+        workspace=workspace,
+        session_source="01_final_curated",
+        required_stage=None,
+        source_table="curated",
+        use_keep_only=True,
+        class_filter=None,
+        class_id_filter=None,
+        rois=None,
+        image_channel=None,
+        image_key="raw",
+    )
+
+    assert context["session"].name == "curated"
+    assert len(context["analysis_points"]) == 2
+    assert context["output_dirs"]["output"] == workspace.root / "02_simple_quant"
+
+
+def test_workspace_output_dirs_use_canonical_stage_names(tmp_path: Path) -> None:
+    workspace = initialize_analysis_workspace(tmp_path, "dataset", "run")
+
+    dirs02 = simple_quant_output_dirs(workspace=workspace)
+    dirs03 = cropped_group_centroid_output_dirs(workspace=workspace)
+    dirs04 = disk_intensity_output_dirs(workspace=workspace)
+
+    assert dirs02["output"] == workspace.root / "02_simple_quant"
+    assert dirs03["output"] == workspace.root / "03_group_centroid"
+    assert dirs04["output"] == workspace.root / "04_intensity_mapping"
+    assert dirs03["figures_final"] == workspace.root / "03_group_centroid" / "figures_final"
+    assert dirs04["figures_final"] == workspace.root / "04_intensity_mapping" / "figures_final"
+    assert not (workspace.root / "03_cropped_group_centroid").exists()
+
+
+def test_export_simple_quant_v2_analysis_updates_workspace_state_and_manifests(tmp_path: Path) -> None:
+    workspace = initialize_analysis_workspace(tmp_path, "dataset", "run")
+    session = AnalysisSession(name="notebook02", raw_image=np.zeros((4, 4), dtype=float))
+
+    manifest = export_simple_quant_v2_analysis(
+        session=session,
+        workspace=workspace,
+        analysis_points=pd.DataFrame({"atom_id": [0], "x_px": [1.0], "y_px": [2.0]}),
+        config={"session_source": "01_final_curated"},
+    )
+
+    assert Path(manifest["session_checkpoint"]) == workspace.root / "02_simple_quant" / "session" / "02_simple_quant.pkl"
+    assert Path(manifest["session_paths"]["workspace_stage"]) == workspace.sessions_dir / "02_simple_quant.pkl"
+    assert (workspace.state_dir / "active_session.pkl").exists()
+    assert (workspace.root / "02_simple_quant" / "manifest.json").exists()
+    assert (workspace.manifests_dir / "02_simple_quant_manifest.json").exists()
+    assert (workspace.manifests_dir / "project_manifest.json").exists()
+
+
+def test_export_notebook03_results_updates_workspace_state_and_manifests(tmp_path: Path) -> None:
+    workspace = initialize_analysis_workspace(tmp_path, "dataset", "run")
+    output_dirs = cropped_group_centroid_output_dirs(workspace=workspace)
+    session = AnalysisSession(name="notebook03", raw_image=np.zeros((4, 4), dtype=float))
+
+    manifest = export_notebook03_results(
+        session=session,
+        output_dirs=output_dirs,
+        tables={"summary": pd.DataFrame({"metric": ["n"], "value": [1]})},
+        figures={},
+        configs={"config": {"ok": True}},
+        workspace=workspace,
+        session_source="01_final_curated",
+    )
+
+    assert Path(manifest["session_checkpoint"]) == workspace.root / "03_group_centroid" / "session" / "03_group_centroid.pkl"
+    assert Path(manifest["session_paths"]["workspace_stage"]) == workspace.sessions_dir / "03_group_centroid.pkl"
+    assert (workspace.state_dir / "active_session.pkl").exists()
+    assert (workspace.root / "03_group_centroid" / "manifest.json").exists()
+    assert (workspace.manifests_dir / "03_group_centroid_manifest.json").exists()
+    assert (workspace.manifests_dir / "project_manifest.json").exists()
+
+
+def test_export_disk_intensity_analysis_updates_workspace_state_and_manifests(tmp_path: Path) -> None:
+    workspace = initialize_analysis_workspace(tmp_path, "dataset", "run")
+    session = AnalysisSession(name="notebook04", raw_image=np.zeros((4, 4), dtype=float))
+
+    manifest = export_disk_intensity_analysis(
+        workspace=workspace,
+        session=session,
+        intensity_table=pd.DataFrame(
+            {
+                "point_id": ["atom:0"],
+                "x_px": [1.0],
+                "y_px": [2.0],
+                "coordinate_source": ["refined"],
+                "disk_intensity_sum": [10.0],
+                "disk_intensity_mean": [2.0],
+                "n_pixels": [5],
+                "is_edge": [False],
+                "status": ["ok"],
+            }
+        ),
+        summary_table=pd.DataFrame({"coordinate_source": ["refined"], "count": [1], "mean": [10.0]}),
+        config={"session_source": "01_final_curated", "coordinate_source": "refined", "disk_radius_px": 2.0},
+        final_figures={},
+    )
+
+    assert Path(manifest["session_checkpoint"]) == workspace.root / "04_intensity_mapping" / "session" / "04_intensity_mapping.pkl"
+    assert Path(manifest["session_paths"]["workspace_stage"]) == workspace.sessions_dir / "04_intensity_mapping.pkl"
+    assert (workspace.state_dir / "active_session.pkl").exists()
+    assert (workspace.root / "04_intensity_mapping" / "manifest.json").exists()
+    assert (workspace.manifests_dir / "04_intensity_mapping_manifest.json").exists()
+    assert (workspace.manifests_dir / "project_manifest.json").exists()

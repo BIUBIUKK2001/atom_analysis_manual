@@ -17,6 +17,7 @@ CANONICAL_STAGE_DIRS = {
     "01_findatom": "01_findatom",
     "02_simple_quant": "02_simple_quant",
     "03_group_centroid": "03_group_centroid",
+    "04_intensity_mapping": "04_intensity_mapping",
 }
 
 STAGE_DIR_ALIASES = {
@@ -32,6 +33,10 @@ STAGE_DIR_ALIASES = {
     "cropped_group_centroid": "03_group_centroid",
     "03_group_centroid": "03_group_centroid",
     "03_cropped_group_centroid": "03_group_centroid",
+    "04": "04_intensity_mapping",
+    "04_intensity": "04_intensity_mapping",
+    "04_disk_intensity": "04_intensity_mapping",
+    "04_intensity_mapping": "04_intensity_mapping",
 }
 
 CANONICAL_STAGE_SESSIONS = {
@@ -42,6 +47,7 @@ CANONICAL_STAGE_SESSIONS = {
     "01_final_curated",
     "02_simple_quant",
     "03_group_centroid",
+    "04_intensity_mapping",
 }
 
 STAGE_SESSION_ALIASES = {
@@ -57,12 +63,17 @@ STAGE_SESSION_ALIASES = {
     "group_centroid": "03_group_centroid",
     "cropped_group_centroid": "03_group_centroid",
     "03_cropped_group_centroid": "03_group_centroid",
+    "04": "04_intensity_mapping",
+    "04_intensity": "04_intensity_mapping",
+    "04_disk_intensity": "04_intensity_mapping",
+    "04_intensity_mapping": "04_intensity_mapping",
 }
 
 STAGE_SUBDIRS = {
     "01_findatom": ("configs", "tables", "figures_preview", "figures_final", "checkpoints"),
     "02_simple_quant": ("configs", "tables", "figures_preview", "figures_final", "session"),
     "03_group_centroid": ("configs", "tables", "figures_preview", "figures_final", "session"),
+    "04_intensity_mapping": ("configs", "tables", "figures_preview", "figures_final", "session"),
 }
 
 

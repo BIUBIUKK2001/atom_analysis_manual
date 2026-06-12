@@ -4,11 +4,12 @@
 
 本项目的核心目标是服务于广泛材料体系的原子柱定位、类别复核、坐标精修和后续几何定量分析，而不是只针对某一个材料体系。HfO2 相关函数作为材料特定扩展保留在源码中，但不是项目的唯一或主要定位。
 
-当前用户工作流已经建立了三个 notebook，并统一使用 analysis workspace 组织输入、stage session、表格、图像和 manifest：
+当前用户工作流已经建立了四个 notebook，并统一使用 analysis workspace 组织输入、stage session、表格、图像和 manifest：
 
 - `notebooks/01_Findatom.ipynb`：通用原子柱定位、自动聚类、人工复核、按类别精修、最终筛选和原子表导出。
 - `notebooks/02_Simple_quantitative_spacing_analysis.ipynb`：基于 01 结果的任务式定量分析，包括周期统计、晶格索引、pair 距离、line grouping 和导出。
 - `notebooks/03_Cropped_group_centroid_analysis.ipynb`：裁剪 ROI 后的组质心与位移分析，用于从局部图像区域中统计类别组中心和组间位移。
+- `notebooks/04_Disk_integrated_intensity_mapping.ipynb`：从 01 final curated 或 active session 读取已分类原子柱坐标，可选择 candidate/refined/curated 坐标源，以固定半径圆盘积分每个原子柱附近像素强度，输出 intensity map 和 histogram，用于筛查是否存在显著低强度原子柱。
 
 自动聚类类别和定量输出都应被视为可检查的分析结果。类别物理含义、ROI 选择、basis vector 选择和最终解释仍需用户判断。
 
@@ -26,7 +27,7 @@
 - 局域几何、reference lattice、local affine strain、vPCF、绘图和导出工具。
 - HfO2 heavy/light 多通道辅助函数。
 
-notebook 层当前已经建立 01、02、03 三个主流程。后续仍可继续扩展更专门的材料体系 notebook、批处理 notebook 或论文图整理 notebook。
+notebook 层当前已经建立 01、02、03、04 四个主流程。后续仍可继续扩展更专门的材料体系 notebook、批处理 notebook 或论文图整理 notebook。
 
 ## Notebook 工作流
 
@@ -78,9 +79,26 @@ notebook 层当前已经建立 01、02、03 三个主流程。后续仍可继续
 7. 导出 Excel。
 8. 导出最终 manifest。
 
+### 04 Disk-Integrated Intensity Mapping
+
+`04_Disk_integrated_intensity_mapping.ipynb` 用于基于 01 已经完成的原子柱定位、分类、精修和 curation 结果，对每个原子柱附近固定半径圆盘内的像素强度求和。
+
+主要步骤：
+
+1. 读取 01 stage session、active session 或手动指定 session pickle。
+2. 选择 `candidate`、`refined` 或 `curated` 坐标源。
+3. 可选按 class 和 ROI 筛选原子柱。
+4. 预览固定半径积分圆盘。
+5. 计算 `disk_intensity_sum` 和 `disk_intensity_mean`。
+6. 绘制原图上的 intensity map。
+7. 绘制 `disk_intensity_sum` histogram。
+8. 导出 CSV、figure、config、manifest 和 04 stage session。
+
+04 不做自动 vacancy 判定，只提供 disk intensity distribution。低强度群体需要结合 histogram、mapping、成像条件和 class 物理意义判断。如果关注疑似 vacancy，建议分别比较 candidate coordinates 与 refined coordinates 两种积分结果。
+
 ## Analysis workspace and output structure
 
-新工作流推荐所有 notebook 共享同一个 analysis workspace。用户只需要在 01、02、03 开头设置同一组参数：
+新工作流推荐所有 notebook 共享同一个 analysis workspace。用户只需要在 01、02、03、04 开头设置同一组参数：
 
 ```python
 OUTPUT_ROOT = Path("D:/analysis_outputs")
@@ -111,6 +129,7 @@ D:/analysis_outputs/HZO_sample01_area03/run_001/
       01_final_curated.pkl
       02_simple_quant.pkl
       03_group_centroid.pkl
+      04_intensity_mapping.pkl
   shared/
     channel_summary.csv
     pixel_calibration.json
@@ -136,14 +155,22 @@ D:/analysis_outputs/HZO_sample01_area03/run_001/
     figures_final/
     session/
     manifest.json
+  04_intensity_mapping/
+    configs/
+    tables/
+    figures_preview/
+    figures_final/
+    session/
+    manifest.json
   manifests/
     01_findatom_manifest.json
     02_simple_quant_manifest.json
     03_group_centroid_manifest.json
+    04_intensity_mapping_manifest.json
     project_manifest.json
 ```
 
-`state/sessions/01_final_curated.pkl` 是 02 和 03 的默认入口。`state/active_session.pkl` 是当前 workspace 的 latest pointer，用于恢复最近运行状态；它不再代表全项目唯一入口。重新打开 notebook 时，只要设置同样的 `OUTPUT_ROOT / DATASET_ID / ANALYSIS_ID`，02/03 就能继续读取 01 保存的 final curated session。
+`state/sessions/01_final_curated.pkl` 是 02、03 和 04 的默认入口。`state/active_session.pkl` 是当前 workspace 的 latest pointer，用于恢复最近运行状态；它不再代表全项目唯一入口。重新打开 notebook 时，只要设置同样的 `OUTPUT_ROOT / DATASET_ID / ANALYSIS_ID`，02/03/04 就能继续读取 01 保存的 final curated session。
 
 `figures_preview/` 用于可选保存调参预览图，默认不保存。`figures_final/` 用于正式导出的图，标题、字体、格式、dpi 和部分 legend/颜色开关在 notebook 的 final export 参数 cell 中设置。`configs/` 保存运行参数，`tables/` 保存 CSV/Excel 表格，stage `manifest.json` 和 `manifests/` 记录导出路径、session 来源和 workspace schema。
 
@@ -158,6 +185,8 @@ D:/analysis_outputs/HZO_sample01_area03/run_001/
 - `figure_config.py`：final figure export 参数规范化，不改变绘图核心 API。
 - `simple_quant.py`：ROI、basis、segment、period、pair、line、group centroid 和 displacement 计算。
 - `simple_quant_plotting.py`：simple quant 相关 overlay、histogram、basis、segment、polygon 和 displacement 绘图。
+- `intensity.py`：固定半径圆盘积分强度点表准备、像素积分和 summary。
+- `intensity_plotting.py`：圆盘积分半径预览、intensity map 和 histogram 绘图。
 - `simple_quant_widgets.py`：napari ROI、direction、basis vector 交互选择。
 - `classification.py`、`detect.py`、`refine.py`、`curate.py`：01 原子定位和分类主流程。
 - `strain.py`、`reference.py`、`metrics.py`、`lattice.py`、`vpcf.py`：后续几何和结构分析能力。
@@ -190,6 +219,7 @@ notebook 由脚本生成：
 python scripts\build_01_findatom_notebook.py
 python scripts\build_02_simple_quant_notebook.py
 python scripts\build_03_cropped_group_centroid_notebook.py
+python scripts\build_04_disk_integrated_intensity_notebook.py
 ```
 
 修改 notebook 结构或同步源码单元时，优先修改 builder script，再重新生成 notebook。
@@ -209,11 +239,13 @@ python scripts\build_03_cropped_group_centroid_notebook.py
 |-- notebooks/
 |   |-- 01_Findatom.ipynb
 |   |-- 02_Simple_quantitative_spacing_analysis.ipynb
-|   `-- 03_Cropped_group_centroid_analysis.ipynb
+|   |-- 03_Cropped_group_centroid_analysis.ipynb
+|   `-- 04_Disk_integrated_intensity_mapping.ipynb
 |-- scripts/
 |   |-- build_01_findatom_notebook.py
 |   |-- build_02_simple_quant_notebook.py
-|   `-- build_03_cropped_group_centroid_notebook.py
+|   |-- build_03_cropped_group_centroid_notebook.py
+|   `-- build_04_disk_integrated_intensity_notebook.py
 |-- src/
 |   `-- em_atom_workbench/
 |       |-- classification.py
@@ -221,6 +253,8 @@ python scripts\build_03_cropped_group_centroid_notebook.py
 |       |-- detect.py
 |       |-- export.py
 |       |-- figure_config.py
+|       |-- intensity.py
+|       |-- intensity_plotting.py
 |       |-- io.py
 |       |-- lattice.py
 |       |-- metrics.py
@@ -250,7 +284,7 @@ python -m pytest
 当前 notebook 和 simple quant 相关重点测试：
 
 ```powershell
-python -m pytest tests/test_workspace.py tests/test_simple_quant.py tests/test_simple_quant_plotting.py tests/test_notebook_02_simple_quant_smoke.py tests/test_notebook02_exports.py tests/test_notebook_smoke.py
+python -m pytest tests/test_workspace.py tests/test_simple_quant.py tests/test_simple_quant_plotting.py tests/test_intensity.py tests/test_notebook_04_disk_intensity_smoke.py tests/test_notebook_02_simple_quant_smoke.py tests/test_notebook02_exports.py tests/test_notebook_smoke.py
 ```
 
 测试主要使用 synthetic data，用来检查接口、表格 schema、notebook 代码单元、导出文件和 session 状态转移，不依赖私有显微数据。
@@ -261,6 +295,8 @@ python -m pytest tests/test_workspace.py tests/test_simple_quant.py tests/test_s
 - 多通道分析默认输入图像已经空间配准且 shape 兼容。
 - 自动 class id 是图像特征类别，不等同于元素标签。
 - 定量结果依赖用户选择的 ROI、class group、basis vector、pair 规则和裁剪区域。
+- 04 不做自动 vacancy 判定，只输出 fixed-radius disk intensity distribution；低强度群体需要结合 histogram、mapping、成像条件和 class 物理意义判断。
+- 如果关注疑似 vacancy，建议比较 candidate coordinates 与 refined coordinates 两种积分结果。
 - DM3/DM4 读取依赖可选 HyperSpy/RosettaSciIO，真实仪器 metadata 需要逐例检查。
 - `results/` 中生成的输出默认不进入 Git，只保留 `results/.gitkeep`。
 

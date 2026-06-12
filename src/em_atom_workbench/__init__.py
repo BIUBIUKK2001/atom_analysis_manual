@@ -29,8 +29,21 @@ from .detect import (
 )
 from .export import export_results
 from .io import load_image, load_image_bundle
+from .intensity import (
+    DiskIntensityConfig,
+    build_disk_offsets,
+    compute_disk_intensity_table,
+    prepare_disk_intensity_points,
+    summarize_disk_intensity,
+)
+from .intensity_plotting import (
+    plot_disk_aperture_preview,
+    plot_disk_intensity_histogram,
+    plot_disk_intensity_map,
+)
 from .lattice import build_neighbor_graph
 from .metrics import compute_local_metrics
+from .notebook_workflows import export_disk_intensity_analysis, initialize_disk_intensity_analysis
 from .polarization import (
     attach_vector_field,
     build_vector_field,
@@ -181,6 +194,7 @@ __all__ = [
     "DetectionConfig",
     "DirectionSpec",
     "DirectionalSpacingTask",
+    "DiskIntensityConfig",
     "ExportConfig",
     "FigureStyleConfig",
     "HfO2MultichannelDetectionConfig",
@@ -212,6 +226,7 @@ __all__ = [
     "assign_points_to_rois",
     "assign_lines_by_projection",
     "attach_vector_field",
+    "build_disk_offsets",
     "build_neighbor_graph",
     "build_roi_basis_table",
     "build_reference_lattice",
@@ -229,6 +244,7 @@ __all__ = [
     "compute_line_spacing",
     "compute_cell_geometry",
     "compute_cell_strain",
+    "compute_disk_intensity_table",
     "compute_local_metrics",
     "compute_local_affine_strain",
     "compute_local_vpcf",
@@ -244,6 +260,7 @@ __all__ = [
     "edit_hfo2_heavy_candidates_with_napari",
     "edit_hfo2_light_candidates_with_napari",
     "edit_candidates_with_napari",
+    "export_disk_intensity_analysis",
     "export_results",
     "expand_tasks_by_roi_basis",
     "find_strict_mutual_nearest_pairs",
@@ -251,6 +268,7 @@ __all__ = [
     "extract_atom_column_features",
     "flip_basis_vectors",
     "full_image_roi",
+    "initialize_disk_intensity_analysis",
     "launch_class_review_napari",
     "launch_napari_candidate_editor",
     "launch_detection_napari_viewer",
@@ -291,10 +309,14 @@ __all__ = [
     "plot_vpcf",
     "plot_class_feature_scatter_matrix",
     "plot_class_overlay",
+    "plot_disk_aperture_preview",
+    "plot_disk_intensity_histogram",
+    "plot_disk_intensity_map",
     "points_for_vpcf",
     "preprocess_channels",
     "preprocess_image",
     "prepare_analysis_points",
+    "prepare_disk_intensity_points",
     "prepare_quant_points",
     "refine_points",
     "refine_points_by_class",
@@ -314,6 +336,7 @@ __all__ = [
     "transform_rois_xy",
     "translate_rois_xy",
     "suggest_annotations",
+    "summarize_disk_intensity",
     "summarize_rois_and_points",
     "suggest_reference_lattices",
     "vector_field_from_point_matches",
