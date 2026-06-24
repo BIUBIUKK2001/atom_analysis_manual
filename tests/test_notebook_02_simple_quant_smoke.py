@@ -116,14 +116,20 @@ def test_build_03_cropped_group_centroid_notebook_generates_compilable_notebook(
         "pick_rois_on_image_with_napari",
         "transform_rois_xy",
         "center_groups",
+        "CENTER_GROUP_CLASS_WEIGHTS",
+        "CENTER_GROUP_WEIGHT_COLUMNS",
         "center_pairs",
         "crop_basis_x_px",
         "add_crop_coordinate_columns_to_group_results",
-        "plot_cropped_group_centers_and_displacements",
+        "plot_charge_center_displacement_map",
         "SHOW_SCALEBAR",
         "ARROW_COLOR",
         "ARROW_TAIL_WIDTH",
-        "DISTANCE_CMAP",
+        "VECTOR_CMAP",
+        "cropped_raw_image",
+        "charge_displacement_arrows",
+        "charge_displacement_magnitude",
+        "charge_displacement_arrows_magnitude",
         "export_cropped_group_centroid_excel",
         "export_notebook03_results",
     ):
@@ -132,14 +138,24 @@ def test_build_03_cropped_group_centroid_notebook_generates_compilable_notebook(
     assert "pixel calibration" in source_by_id["load-session"]
     assert "crop-local/global" in source_by_id["run-analysis"] or "crop-local" in source_by_id["run-md"]
     assert "scalebar_length_nm" in source_by_id["figure"]
-    assert "show_centers=False" in source_by_id["figure"]
-    assert "#d62728" in source_by_id["figure"]
+    assert "plot_charge_center_displacement_map" in source_by_id["figure"]
+    assert "mode='raw'" in source_by_id["figure"]
+    assert "mode='arrows'" in source_by_id["figure"]
+    assert "mode='magnitude'" in source_by_id["figure"]
+    assert "mode='combined'" in source_by_id["figure"]
+    assert "show_roi_outlines=SHOW_ROI_OUTLINES" in source_by_id["figure"]
     assert "show_scalebar=SHOW_SCALEBAR" in source_by_id["figure"]
     assert "SHOW_SCALEBAR = False" in source_by_id["figure"]
     assert "arrow_tail_width=ARROW_TAIL_WIDTH" in source_by_id["figure"]
-    assert "'magma'" in source_by_id["figure"]
+    assert "VECTOR_CMAP = 'magma'" in source_by_id["figure"]
+    assert "'cropped_raw_image'" in source_by_id["final-figure-export-parameters"]
+    assert "'charge_displacement_arrows'" in source_by_id["final-figure-export-parameters"]
+    assert "'charge_displacement_magnitude'" in source_by_id["final-figure-export-parameters"]
+    assert "'charge_displacement_arrows_magnitude'" in source_by_id["final-figure-export-parameters"]
     assert "03_group_centroid" in joined
     assert "03_cropped_group_centroid" not in joined
+    assert "center_group_class_weights=CENTER_GROUP_CLASS_WEIGHTS" in source_by_id["run-analysis"]
+    assert "center_group_weight_columns=CENTER_GROUP_WEIGHT_COLUMNS" in source_by_id["run-analysis"]
 
     for cell in notebook.get("cells", []):
         assert cell.get("id")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -3125,14 +3126,105 @@ def summarize_pair_lines_median_iqr(pair_line_table: pd.DataFrame) -> pd.DataFra
     return pd.DataFrame(rows)[columns]
 
 
+def _resolve_group_class_weights(
+    group_name: str,
+    class_ids: tuple[int, ...],
+    center_group_class_weights: Mapping[str, Any] | None,
+) -> dict[int, float]:
+    if not center_group_class_weights:
+        return {}
+    raw_spec = center_group_class_weights.get(str(group_name))
+    if raw_spec is None:
+        return {}
+    if isinstance(raw_spec, Mapping):
+        return {int(class_id): float(weight) for class_id, weight in raw_spec.items()}
+    if isinstance(raw_spec, (list, tuple, np.ndarray, pd.Series)):
+        if len(raw_spec) != len(class_ids):
+            raise ValueError(
+                f"center_group_class_weights[{group_name!r}] has {len(raw_spec)} weights, "
+                f"but group has {len(class_ids)} class ids."
+            )
+        return {int(class_id): float(weight) for class_id, weight in zip(class_ids, raw_spec, strict=True)}
+    return {int(class_id): float(raw_spec) for class_id in class_ids}
+
+
+def _resolve_group_weight_column(group_name: str, center_group_weight_columns: str | Mapping[str, str] | None) -> str | None:
+    if center_group_weight_columns is None:
+        return None
+    if isinstance(center_group_weight_columns, str):
+        return center_group_weight_columns or None
+    return center_group_weight_columns.get(str(group_name))
+
+
+def _weighted_group_center(
+    group: pd.DataFrame,
+    *,
+    class_weights: dict[int, float],
+    weight_column: str | None,
+) -> dict[str, Any]:
+    x = pd.to_numeric(group["x_px"], errors="coerce")
+    y = pd.to_numeric(group["y_px"], errors="coerce")
+    weights = pd.Series(1.0, index=group.index, dtype=float)
+    mode_parts: list[str] = []
+    class_weight_spec = ""
+    if class_weights:
+        if "class_id" not in group.columns:
+            raise ValueError("class_id column is required when center_group_class_weights is set.")
+        class_ids = pd.to_numeric(group["class_id"], errors="coerce")
+        weights *= class_ids.map(lambda value: class_weights.get(int(value), 1.0) if pd.notna(value) else np.nan)
+        class_weight_spec = ",".join(f"{class_id}:{weight:g}" for class_id, weight in sorted(class_weights.items()))
+        mode_parts.append("class")
+    if weight_column:
+        if weight_column not in group.columns:
+            raise ValueError(f"Weight column {weight_column!r} is not present in analysis_points.")
+        weights *= pd.to_numeric(group[weight_column], errors="coerce")
+        mode_parts.append(f"column:{weight_column}")
+
+    weighted = bool(mode_parts)
+    finite = x.notna() & y.notna()
+    if weighted:
+        finite &= weights.replace([np.inf, -np.inf], np.nan).notna() & (weights > 0)
+        usable_weights = weights.loc[finite].astype(float)
+        weight_sum = float(usable_weights.sum()) if len(usable_weights) else 0.0
+        if weight_sum > 0:
+            usable_x = x.loc[finite].astype(float)
+            usable_y = y.loc[finite].astype(float)
+            center_x = float(np.average(usable_x, weights=usable_weights))
+            center_y = float(np.average(usable_y, weights=usable_weights))
+            std_x = float(np.sqrt(np.average((usable_x - center_x) ** 2, weights=usable_weights))) if len(usable_x) > 1 else np.nan
+            std_y = float(np.sqrt(np.average((usable_y - center_y) ** 2, weights=usable_weights))) if len(usable_y) > 1 else np.nan
+        else:
+            center_x = center_y = std_x = std_y = np.nan
+    else:
+        usable_weights = pd.Series(1.0, index=group.index, dtype=float)
+        weight_sum = float(len(group))
+        center_x = float(x.mean())
+        center_y = float(y.mean())
+        std_x = float(x.std(ddof=1)) if len(group) > 1 else np.nan
+        std_y = float(y.std(ddof=1)) if len(group) > 1 else np.nan
+    return {
+        "center_x": center_x,
+        "center_y": center_y,
+        "center_x_std": std_x,
+        "center_y_std": std_y,
+        "weight_mode": "+".join(mode_parts) if mode_parts else "unweighted",
+        "weight_column": weight_column or "",
+        "class_weight_spec": class_weight_spec,
+        "weight_sum": weight_sum,
+        "weighted_point_count": int(len(usable_weights)) if weighted else int(len(group)),
+    }
+
+
 def compute_group_centroids_by_roi(
     analysis_points: pd.DataFrame,
     *,
     center_groups: dict[str, tuple[int, ...] | list[int]],
+    center_group_class_weights: Mapping[str, Any] | None = None,
+    center_group_weight_columns: str | Mapping[str, str] | None = None,
     roi_ids: tuple[str, ...] | list[str] | None = None,
     min_points: int = 1,
 ) -> pd.DataFrame:
-    """Compute unweighted geometric centroids for Task 3 class groups."""
+    """Compute geometric centroids for Task 3 class groups, optionally weighted."""
 
     if roi_ids is None:
         roi_ids = tuple(str(value) for value in analysis_points["roi_id"].dropna().astype(str).unique())
@@ -3143,7 +3235,25 @@ def compute_group_centroids_by_roi(
         for group_name, class_ids_value in center_groups.items():
             class_ids = tuple(int(value) for value in class_ids_value)
             group = roi_points.loc[roi_points["class_id"].isin(class_ids)].copy() if "class_id" in roi_points.columns else pd.DataFrame()
+            class_weights = _resolve_group_class_weights(str(group_name), class_ids, center_group_class_weights)
+            weight_column = _resolve_group_weight_column(str(group_name), center_group_weight_columns)
+            center_stats = _weighted_group_center(group, class_weights=class_weights, weight_column=weight_column) if len(group) else {
+                "center_x": np.nan,
+                "center_y": np.nan,
+                "center_x_std": np.nan,
+                "center_y_std": np.nan,
+                "weight_mode": "unweighted" if not class_weights and not weight_column else "class" if class_weights and not weight_column else f"column:{weight_column}" if weight_column and not class_weights else f"class+column:{weight_column}",
+                "weight_column": weight_column or "",
+                "class_weight_spec": ",".join(f"{class_id}:{weight:g}" for class_id, weight in sorted(class_weights.items())),
+                "weight_sum": 0.0,
+                "weighted_point_count": 0,
+            }
             valid = len(group) >= int(min_points)
+            if valid and center_stats["weight_mode"] != "unweighted":
+                valid = center_stats["weighted_point_count"] >= int(min_points) and float(center_stats["weight_sum"]) > 0
+            invalid_reason = "" if valid else "not_enough_points"
+            if len(group) >= int(min_points) and center_stats["weight_mode"] != "unweighted" and not valid:
+                invalid_reason = "invalid_weights"
             rows.append(
                 {
                     "roi_id": str(roi_id),
@@ -3151,12 +3261,17 @@ def compute_group_centroids_by_roi(
                     "group_name": str(group_name),
                     "class_ids": ",".join(str(value) for value in class_ids),
                     "n_points": int(len(group)),
-                    "center_x": float(group["x_px"].mean()) if valid else np.nan,
-                    "center_y": float(group["y_px"].mean()) if valid else np.nan,
-                    "center_x_std": float(group["x_px"].std(ddof=1)) if len(group) > 1 else np.nan,
-                    "center_y_std": float(group["y_px"].std(ddof=1)) if len(group) > 1 else np.nan,
+                    "center_x": center_stats["center_x"] if valid else np.nan,
+                    "center_y": center_stats["center_y"] if valid else np.nan,
+                    "center_x_std": center_stats["center_x_std"] if valid else np.nan,
+                    "center_y_std": center_stats["center_y_std"] if valid else np.nan,
+                    "weight_mode": center_stats["weight_mode"],
+                    "weight_column": center_stats["weight_column"],
+                    "class_weight_spec": center_stats["class_weight_spec"],
+                    "weight_sum": center_stats["weight_sum"],
+                    "weighted_point_count": center_stats["weighted_point_count"],
                     "valid": bool(valid),
-                    "invalid_reason": "" if valid else "not_enough_points",
+                    "invalid_reason": invalid_reason,
                 }
             )
     result = pd.DataFrame(rows)

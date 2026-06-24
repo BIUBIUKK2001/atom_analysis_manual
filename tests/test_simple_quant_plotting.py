@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import matplotlib.colors as mcolors
+from matplotlib.collections import PatchCollection
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 import numpy as np
@@ -11,6 +12,7 @@ from em_atom_workbench.simple_quant import AnalysisROI, BasisVectorSpec, resolve
 from em_atom_workbench.simple_quant_plotting import (
     add_nm_scalebar,
     build_period_histogram_title_table,
+    plot_charge_center_displacement_map,
     plot_cropped_group_centers_and_displacements,
     plot_basis_check_on_image,
     plot_basis_vectors_on_image,
@@ -438,6 +440,118 @@ def test_add_nm_scalebar_requires_pixel_calibration() -> None:
 
     plt.close(fig)
 
+
+
+
+def _charge_center_rois() -> list[AnalysisROI]:
+    return [
+        AnalysisROI(
+            roi_id="roi_1",
+            roi_name="ROI_1",
+            polygon_xy_px=((2.0, 2.0), (14.0, 2.0), (14.0, 14.0), (2.0, 14.0)),
+            color="#ff9f1c",
+        ),
+        AnalysisROI(
+            roi_id="roi_2",
+            roi_name="ROI_2",
+            polygon_xy_px=((15.0, 2.0), (24.0, 2.0), (24.0, 14.0), (15.0, 14.0)),
+            color="#2ec4b6",
+        ),
+    ]
+
+
+def _charge_center_displacements() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "roi_id": ["roi_1", "roi_2"],
+            "roi_name": ["ROI_1", "ROI_2"],
+            "group_A": ["group_A", "group_A"],
+            "group_B": ["group_B", "group_B"],
+            "center_A_x_local_px": [5.0, 18.0],
+            "center_A_y_local_px": [6.0, 5.0],
+            "center_B_x_local_px": [11.0, 20.0],
+            "center_B_y_local_px": [10.0, 7.0],
+            "center_A_x": [5.0, 18.0],
+            "center_A_y": [6.0, 5.0],
+            "center_B_x": [11.0, 20.0],
+            "center_B_y": [10.0, 7.0],
+            "dx_px": [6.0, 2.0],
+            "dy_px": [4.0, 2.0],
+            "distance_px": [np.hypot(6.0, 4.0), np.hypot(2.0, 2.0)],
+            "distance_A": [7.21, 2.83],
+            "distance_nm": [0.721, 0.283],
+            "valid": [True, False],
+            "invalid_reason": ["", "invalid_group_centroid"],
+        }
+    )
+
+
+def test_plot_charge_center_displacement_map_modes() -> None:
+    image = np.arange(30 * 30, dtype=float).reshape(30, 30)
+    rois = _charge_center_rois()
+    displacements = _charge_center_displacements()
+
+    raw_fig, raw_ax = plot_charge_center_displacement_map(
+        image,
+        rois,
+        displacements,
+        pixel_to_nm=0.1,
+        mode="raw",
+        title="raw",
+    )
+    assert len(raw_ax.images) == 1
+    assert not [child for child in raw_ax.get_children() if isinstance(child, FancyArrowPatch)]
+    assert not [collection for collection in raw_ax.collections if isinstance(collection, PatchCollection)]
+    assert len(raw_fig.axes) == 1
+    plt.close(raw_fig)
+
+    arrow_fig, arrow_ax = plot_charge_center_displacement_map(
+        image,
+        rois,
+        displacements,
+        pixel_to_nm=0.1,
+        mode="arrows",
+        vector_scale=1.0,
+        show_vector_scale_label=False,
+    )
+    arrows = [child for child in arrow_ax.get_children() if isinstance(child, FancyArrowPatch)]
+    assert len(arrows) == 1
+    assert getattr(arrows[0], "_charge_center_midpoint") == pytest.approx((8.0, 8.0))
+    assert getattr(arrows[0], "_charge_center_start") == pytest.approx((5.0, 6.0))
+    assert getattr(arrows[0], "_charge_center_end") == pytest.approx((11.0, 10.0))
+    assert not [collection for collection in arrow_ax.collections if isinstance(collection, PatchCollection)]
+    assert len(arrow_fig.axes) == 1
+    plt.close(arrow_fig)
+
+    magnitude_fig, magnitude_ax = plot_charge_center_displacement_map(
+        image,
+        rois,
+        displacements,
+        pixel_to_nm=0.1,
+        mode="magnitude",
+        value_column="distance_A",
+    )
+    assert not [child for child in magnitude_ax.get_children() if isinstance(child, FancyArrowPatch)]
+    magnitude_collections = [collection for collection in magnitude_ax.collections if isinstance(collection, PatchCollection)]
+    assert len(magnitude_collections) == 1
+    assert magnitude_collections[0].get_array().tolist() == pytest.approx([7.21])
+    assert len(magnitude_fig.axes) == 2
+    assert magnitude_fig.axes[1].get_ylabel() == "Displacement (Å)"
+    plt.close(magnitude_fig)
+
+    combined_fig, combined_ax = plot_charge_center_displacement_map(
+        image,
+        rois,
+        displacements,
+        pixel_to_nm=0.1,
+        mode="combined",
+        vector_scale=1.0,
+        show_vector_scale_label=False,
+    )
+    assert [child for child in combined_ax.get_children() if isinstance(child, FancyArrowPatch)]
+    assert [collection for collection in combined_ax.collections if isinstance(collection, PatchCollection)]
+    assert len(combined_fig.axes) == 2
+    plt.close(combined_fig)
 
 def test_plot_cropped_group_centers_draws_filled_arrows_distance_field_and_no_scalebar() -> None:
     image = np.zeros((20, 20), dtype=float)

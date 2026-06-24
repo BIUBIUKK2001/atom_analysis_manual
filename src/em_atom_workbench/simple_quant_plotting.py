@@ -1992,6 +1992,325 @@ def _distance_value_column(displacements: pd.DataFrame) -> tuple[str | None, str
     return None, "Displacement"
 
 
+def _contrast_limits(
+    image: np.ndarray | None,
+    contrast_percentiles: tuple[float, float] | list[float] | None,
+) -> dict[str, float]:
+    if image is None or contrast_percentiles is None:
+        return {}
+    arr = np.asarray(image)
+    if arr.ndim != 2 or not np.issubdtype(arr.dtype, np.number):
+        return {}
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {}
+    low, high = float(contrast_percentiles[0]), float(contrast_percentiles[1])
+    vmin, vmax = np.nanpercentile(finite, [low, high])
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or float(vmin) == float(vmax):
+        return {}
+    return {"vmin": float(vmin), "vmax": float(vmax)}
+
+
+def _show_contrast_image(
+    ax,
+    image: np.ndarray | None,
+    *,
+    contrast_percentiles: tuple[float, float] | list[float] | None = (1.0, 99.0),
+) -> np.ndarray | None:
+    if image is None:
+        _show_image(ax, image)
+        return None
+    display_image = _display_image_array(image)
+    kwargs = _contrast_limits(display_image, contrast_percentiles)
+    ax.imshow(display_image, cmap="gray", origin="upper", **kwargs)
+    ax.set_xlim(0, display_image.shape[1])
+    ax.set_ylim(display_image.shape[0], 0)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return display_image
+
+
+def _displacement_coordinate_columns(displacements: pd.DataFrame, coordinate_space: str) -> tuple[str, str, str, str]:
+    space = str(coordinate_space).lower()
+    if space == "local":
+        candidates = (
+            ("center_A_x_local_px", "center_A_y_local_px", "center_B_x_local_px", "center_B_y_local_px"),
+            ("center_A_x", "center_A_y", "center_B_x", "center_B_y"),
+        )
+    elif space == "global":
+        candidates = (
+            ("center_A_x_global_px", "center_A_y_global_px", "center_B_x_global_px", "center_B_y_global_px"),
+            ("center_A_x", "center_A_y", "center_B_x", "center_B_y"),
+        )
+    else:
+        raise ValueError("coordinate_space must be 'local' or 'global'.")
+    for columns in candidates:
+        if set(columns).issubset(displacements.columns):
+            return columns
+    raise ValueError("group_displacement_table does not contain usable group-center coordinate columns.")
+
+
+def _charge_value_column(displacements: pd.DataFrame, value_column: str | None) -> tuple[str | None, str]:
+    if value_column:
+        if value_column not in displacements.columns:
+            raise ValueError(f"value_column {value_column!r} is not present in group_displacement_table.")
+        labels = {
+            "distance_nm": "Displacement (nm)",
+            "distance_A": "Displacement (Å)",
+            "distance_px": "Displacement (px)",
+        }
+        return value_column, labels.get(str(value_column), str(value_column))
+    return _distance_value_column(displacements)
+
+
+def _charge_arrow_scale(
+    rows: pd.DataFrame,
+    *,
+    x_a: str,
+    y_a: str,
+    x_b: str,
+    y_b: str,
+    image_shape: tuple[int, ...] | None,
+    vector_scale: float | str | None,
+    auto_target_fraction: float,
+    auto_max_scale: float,
+) -> float:
+    if vector_scale is None:
+        return 1.0
+    if isinstance(vector_scale, str):
+        if vector_scale.lower() != "auto":
+            raise ValueError("vector_scale must be a number, None, or 'auto'.")
+        dx = pd.to_numeric(rows[x_b], errors="coerce") - pd.to_numeric(rows[x_a], errors="coerce")
+        dy = pd.to_numeric(rows[y_b], errors="coerce") - pd.to_numeric(rows[y_a], errors="coerce")
+        lengths = np.hypot(dx.to_numpy(dtype=float), dy.to_numpy(dtype=float))
+        lengths = lengths[np.isfinite(lengths) & (lengths > 0)]
+        if lengths.size == 0:
+            return 1.0
+        if image_shape is None or len(image_shape) < 2:
+            target = 10.0
+        else:
+            target = max(6.0, float(min(image_shape[0], image_shape[1])) * float(auto_target_fraction))
+        scale = target / float(np.nanmedian(lengths))
+        return float(np.clip(scale, 1.0, float(auto_max_scale)))
+    return float(vector_scale)
+
+
+def _draw_charge_roi_outlines(
+    ax,
+    roi_records: list[dict[str, Any]],
+    *,
+    color: str,
+    linewidth: float,
+    alpha: float,
+    zorder: int,
+) -> None:
+    for record in roi_records:
+        if not bool(record.get("enabled", True)):
+            continue
+        polygon = _coerce_polygon(record.get("polygon_xy_px"))
+        if polygon is None:
+            continue
+        ax.add_patch(
+            Polygon(
+                polygon,
+                closed=True,
+                fill=False,
+                edgecolor=color,
+                linewidth=float(linewidth),
+                alpha=float(alpha),
+                zorder=zorder,
+            )
+        )
+
+
+def plot_charge_center_displacement_map(
+    image: np.ndarray | None,
+    measurement_rois,
+    group_displacement_table: pd.DataFrame,
+    *,
+    pixel_to_nm: float | None,
+    mode: str = "combined",
+    coordinate_space: str = "local",
+    style: FigureStyleConfig | dict | None = None,
+    title: str = "Charge-center displacement",
+    contrast_percentiles: tuple[float, float] | list[float] | None = (1.0, 99.0),
+    value_column: str | None = None,
+    magnitude_cmap: str = "magma",
+    magnitude_alpha: float = 0.48,
+    show_colorbar: bool = True,
+    show_roi_outlines: bool = True,
+    roi_outline_color: str = "#f5f5f5",
+    roi_outline_linewidth: float = 0.7,
+    roi_outline_alpha: float = 0.75,
+    arrow_color: str = "#ffffff",
+    arrow_edge_color: str | None = "#111111",
+    arrow_linewidth: float = 0.35,
+    arrow_mutation_scale: float = 1.0,
+    arrow_tail_width: float = 0.35,
+    arrow_head_width: float = 1.7,
+    arrow_head_length: float = 2.0,
+    arrow_alpha: float = 0.95,
+    vector_scale: float | str | None = "auto",
+    vector_auto_target_fraction: float = 0.045,
+    vector_auto_max_scale: float = 30.0,
+    show_vector_scale_label: bool = True,
+    scalebar_length_nm: float | None = None,
+    show_scalebar: bool = False,
+    scalebar_color: str = "white",
+    scalebar_linewidth: float | None = None,
+    scalebar_location: str = "lower right",
+):
+    """Plot charge-center displacement maps on a cropped image.
+
+    ``mode`` controls the overlay: ``raw`` draws only the image, ``arrows`` draws
+    midpoint-anchored vectors, ``magnitude`` draws ROI polygons colored by
+    displacement magnitude, and ``combined`` draws both.
+    """
+
+    mode = str(mode).lower()
+    valid_modes = {"raw", "arrows", "magnitude", "combined"}
+    if mode not in valid_modes:
+        raise ValueError(f"mode must be one of {sorted(valid_modes)!r}.")
+
+    config = coerce_figure_style(style)
+    apply_publication_style(config)
+    fig, ax = _prepare_axes(figsize=(5.5, 5.5))
+    display_image = _show_contrast_image(ax, image, contrast_percentiles=contrast_percentiles)
+    image_shape = display_image.shape if display_image is not None else None
+
+    displacements = group_displacement_table.copy() if group_displacement_table is not None else pd.DataFrame()
+    valid_displacements = pd.DataFrame()
+    if not displacements.empty:
+        valid_displacements = displacements.loc[displacements.get("valid", False).astype(bool)].copy()
+
+    roi_records = _roi_outline_records(measurement_rois)
+    roi_by_id = {str(record.get("roi_id", "")): record for record in roi_records}
+
+    draw_magnitude = mode in {"magnitude", "combined"}
+    draw_arrows = mode in {"arrows", "combined"}
+    if draw_magnitude and not valid_displacements.empty:
+        value_name, value_label = _charge_value_column(valid_displacements, value_column)
+        if value_name is not None:
+            patches = []
+            values = []
+            for _, row in valid_displacements.iterrows():
+                value = pd.to_numeric(pd.Series([row.get(value_name, np.nan)]), errors="coerce").iloc[0]
+                if not np.isfinite(float(value)):
+                    continue
+                record = roi_by_id.get(str(row.get("roi_id", "")))
+                if record is None:
+                    continue
+                polygon = _coerce_polygon(record.get("polygon_xy_px"))
+                if polygon is None:
+                    continue
+                patches.append(Polygon(polygon, closed=True))
+                values.append(float(value))
+            if patches and values:
+                collection = PatchCollection(
+                    patches,
+                    cmap=magnitude_cmap,
+                    alpha=float(magnitude_alpha),
+                    edgecolors=roi_outline_color if show_roi_outlines else "none",
+                    linewidths=float(roi_outline_linewidth if show_roi_outlines else 0.0),
+                    zorder=3,
+                )
+                value_array = np.asarray(values, dtype=float)
+                collection.set_array(value_array)
+                collection.set_clim(float(np.nanmin(value_array)), float(np.nanmax(value_array)))
+                ax.add_collection(collection)
+                if show_colorbar:
+                    colorbar = fig.colorbar(collection, ax=ax, fraction=0.035, pad=0.02)
+                    colorbar.set_label(value_label)
+
+    if show_roi_outlines and mode in {"arrows"}:
+        _draw_charge_roi_outlines(
+            ax,
+            roi_records,
+            color=roi_outline_color,
+            linewidth=roi_outline_linewidth,
+            alpha=roi_outline_alpha,
+            zorder=4,
+        )
+
+    if draw_arrows and not valid_displacements.empty:
+        x_a, y_a, x_b, y_b = _displacement_coordinate_columns(valid_displacements, coordinate_space)
+        arrow_scale = _charge_arrow_scale(
+            valid_displacements,
+            x_a=x_a,
+            y_a=y_a,
+            x_b=x_b,
+            y_b=y_b,
+            image_shape=image_shape,
+            vector_scale=vector_scale,
+            auto_target_fraction=vector_auto_target_fraction,
+            auto_max_scale=vector_auto_max_scale,
+        )
+        for _, row in valid_displacements.iterrows():
+            xa = float(row.get(x_a, np.nan))
+            ya = float(row.get(y_a, np.nan))
+            xb = float(row.get(x_b, np.nan))
+            yb = float(row.get(y_b, np.nan))
+            if not np.isfinite([xa, ya, xb, yb]).all():
+                continue
+            mid_x = (xa + xb) / 2.0
+            mid_y = (ya + yb) / 2.0
+            dx = (xb - xa) * arrow_scale
+            dy = (yb - ya) * arrow_scale
+            start = (mid_x - dx / 2.0, mid_y - dy / 2.0)
+            end = (mid_x + dx / 2.0, mid_y + dy / 2.0)
+            arrow = FancyArrowPatch(
+                start,
+                end,
+                arrowstyle=(
+                    f"Simple,tail_width={float(arrow_tail_width)},"
+                    f"head_width={float(arrow_head_width)},head_length={float(arrow_head_length)}"
+                ),
+                mutation_scale=float(arrow_mutation_scale),
+                linewidth=float(arrow_linewidth),
+                facecolor=arrow_color,
+                edgecolor=arrow_edge_color if arrow_edge_color is not None else arrow_color,
+                alpha=float(arrow_alpha),
+                shrinkA=0.0,
+                shrinkB=0.0,
+                zorder=6,
+            )
+            arrow._charge_center_midpoint = (mid_x, mid_y)  # type: ignore[attr-defined]
+            arrow._charge_center_start = start  # type: ignore[attr-defined]
+            arrow._charge_center_end = end  # type: ignore[attr-defined]
+            arrow._charge_center_vector_scale = arrow_scale  # type: ignore[attr-defined]
+            ax.add_patch(arrow)
+        if show_vector_scale_label and arrow_scale != 1.0:
+            ax.text(
+                0.02,
+                0.98,
+                f"arrow x{arrow_scale:.1f}",
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                color="white",
+                fontsize=8,
+                bbox={"facecolor": "black", "alpha": 0.45, "edgecolor": "none", "pad": 2.0},
+                zorder=8,
+            )
+
+    if show_scalebar:
+        add_nm_scalebar(
+            ax,
+            pixel_to_nm=pixel_to_nm,
+            length_nm=scalebar_length_nm,
+            location=scalebar_location,
+            color=scalebar_color,
+            linewidth=float(scalebar_linewidth if scalebar_linewidth is not None else max(config.line_width, 1.2)),
+        )
+    ax.set_title(title)
+    return fig, ax
+
+
 def _smooth_scalar_field(
     image_shape: tuple[int, int],
     x: np.ndarray,

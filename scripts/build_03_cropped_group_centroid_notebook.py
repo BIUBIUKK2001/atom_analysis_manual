@@ -71,7 +71,7 @@ from em_atom_workbench import (
     full_image_roi,
     pick_rois_on_image_with_napari,
     pick_rois_with_napari,
-    plot_cropped_group_centers_and_displacements,
+    plot_charge_center_displacement_map,
     summarize_rois_and_points,
     transform_rois_xy,
     initialize_analysis_workspace,
@@ -294,7 +294,7 @@ display(summarize_rois_and_points(measurement_points, rois=MEASUREMENT_ROIS))
             """
 ## 3. Configure class groups and center pairs
 
-每个 group 可以包含一个或多个 `class_id`。几何中心是 ROI 内该 group 所有原子的无权重平均中心。`center_pairs` 的方向约定是 `group_A -> group_B`。
+每个 group 可以包含一个或多个 `class_id`。默认几何中心是 ROI 内该 group 所有原子的无权重平均中心；如需加权，可设置每个 group 的 class 权重或权重列。`center_pairs` 的方向约定是 `group_A -> group_B`。
 """,
         ),
         code(
@@ -311,8 +311,29 @@ center_pairs = [
 
 MIN_POINTS_PER_GROUP = 1
 
+# 可选：按 class_id 加权。未列出的 class_id 权重默认为 1.0。
+# 写法 1：dict，适合 group 内 class_id 权重不连续或需要显式标注。
+# 写法 2：list/tuple，顺序必须和 center_groups[group_name] 一致。
+CENTER_GROUP_CLASS_WEIGHTS = {
+    # 'group_A': {0: 1.0},
+    # 'group_B': {1: 1.0, 2: 2.0},
+    # 'group_B': [1.0, 2.0],
+}
+
+# 可选：按表格中的数值列加权，例如 'quality_score'。
+# 可以写成全局字符串，也可以按 group 分别指定列名。
+CENTER_GROUP_WEIGHT_COLUMNS = {
+    # 'group_A': 'quality_score',
+    # 'group_B': 'quality_score',
+}
+
 group_config_table = pd.DataFrame([
-    {'group_name': key, 'class_ids': ','.join(str(value) for value in values)}
+    {
+        'group_name': key,
+        'class_ids': ','.join(str(value) for value in values),
+        'class_weights': CENTER_GROUP_CLASS_WEIGHTS.get(key, ''),
+        'weight_column': CENTER_GROUP_WEIGHT_COLUMNS.get(key, '') if isinstance(CENTER_GROUP_WEIGHT_COLUMNS, dict) else CENTER_GROUP_WEIGHT_COLUMNS,
+    }
     for key, values in center_groups.items()
 ])
 display(group_config_table)
@@ -332,6 +353,8 @@ display(group_config_table)
 group_centroid_table_raw = compute_group_centroids_by_roi(
     measurement_points,
     center_groups=center_groups,
+    center_group_class_weights=CENTER_GROUP_CLASS_WEIGHTS,
+    center_group_weight_columns=CENTER_GROUP_WEIGHT_COLUMNS,
     min_points=MIN_POINTS_PER_GROUP,
 )
 group_displacement_table_raw = compute_group_pair_displacements(
@@ -366,7 +389,7 @@ display(summary)
             """
 ## 5. Plot cropped displacement arrows
 
-最终图只显示裁剪后的背景图、`group_A -> group_B` 填充箭头和按距离插值得到的平滑着色层；不显示 measurement ROI、不显示几何中心点、不显示 scalebar。箭头起止位置严格等于计算得到的两个几何中心。
+最终图输出四张裁剪区域图：未叠加原图、纯箭头、纯位移大小色图、箭头+色图。色图按每个 measurement ROI / 原胞的 `group_A -> group_B` 位移大小着色；箭头以 A/B 中点为锚点，方向沿 `group_A -> group_B`，视觉长度可自动放大。
 """,
         ),
         code(
@@ -374,40 +397,47 @@ display(summary)
             """
 SHOW_SCALEBAR = False          # 03 默认不在图中显示 scalebar。
 SCALEBAR_LENGTH_NM = None      # 若 SHOW_SCALEBAR=True，可设置具体 nm 长度；None 自动估计。
-SCALEBAR_COLOR = 'black'
+SCALEBAR_COLOR = 'white'
 SCALEBAR_LINEWIDTH = 1.2
 SCALEBAR_LOCATION = 'lower right'
-# 箭头颜色可用任意 matplotlib 颜色名或 hex。
-# 常用候选：'black'/'#111111'、'white'/'#ffffff'、'red'/'#d62728'、'blue'/'#1f77b4'、
-#          'orange'/'#ff7f0e'、'yellow'/'#ffe600'、'purple'/'#9467bd'、'cyan'/'#17becf'。
-ARROW_COLOR = '#ffe600'
-ARROW_EDGE_COLOR = '#111111'   # 不需要边线时设为 None。
-ARROW_LINEWIDTH = 0.25
-ARROW_MUTATION_SCALE = 7.0
-ARROW_TAIL_WIDTH = 0.65
-ARROW_HEAD_WIDTH = 4.0
-ARROW_HEAD_LENGTH = 4.8
-ARROW_ALPHA = 0.95
-# 距离插值色图常用候选：'magma'、'inferno'、'viridis'、'cividis'、'plasma'、'turbo'。
-DISTANCE_CMAP = 'magma'
-DISTANCE_ALPHA = 0.42
-INTERPOLATION_SIGMA_PX = None  # None 表示根据裁剪图尺寸自动估计。
-SHOW_DISTANCE_COLORBAR = True
 
-fig, ax = plot_cropped_group_centers_and_displacements(
-    cropped_background_image,
-    group_centroid_table,
-    group_displacement_table,
+BACKGROUND_CONTRAST_PERCENTILES = (1.0, 99.0)
+VECTOR_VALUE_COLUMN = 'distance_A'  # None 时自动优先使用 distance_nm，其次 distance_A / distance_px。
+VECTOR_CMAP = 'magma'
+VECTOR_ALPHA = 0.46
+SHOW_VECTOR_COLORBAR = True
+SHOW_ROI_OUTLINES = True
+ROI_OUTLINE_COLOR = '#f5f5f5'
+ROI_OUTLINE_LINEWIDTH = 0.65
+ROI_OUTLINE_ALPHA = 0.72
+
+ARROW_COLOR = '#ffffff'
+ARROW_EDGE_COLOR = '#111111'   # 不需要边线时设为 None。
+ARROW_LINEWIDTH = 0.32
+ARROW_MUTATION_SCALE = 1.0
+ARROW_TAIL_WIDTH = 0.34
+ARROW_HEAD_WIDTH = 1.7
+ARROW_HEAD_LENGTH = 2.0
+ARROW_ALPHA = 0.96
+VECTOR_SCALE = 'auto'          # 'auto' 会放大小位移，数值则直接作为倍率。
+VECTOR_AUTO_TARGET_FRACTION = 0.045
+VECTOR_AUTO_MAX_SCALE = 30.0
+SHOW_VECTOR_SCALE_LABEL = True
+
+_charge_plot_common = dict(
+    image=cropped_background_image,
+    measurement_rois=MEASUREMENT_ROIS,
+    group_displacement_table=group_displacement_table,
     pixel_to_nm=PIXEL_TO_NM,
+    coordinate_space='local',
     style=FIG_STYLE,
-    title='Cropped group-center displacement',
-    show_scalebar=SHOW_SCALEBAR,
-    scalebar_length_nm=SCALEBAR_LENGTH_NM,
-    scalebar_color=SCALEBAR_COLOR,
-    scalebar_linewidth=SCALEBAR_LINEWIDTH,
-    scalebar_location=SCALEBAR_LOCATION,
-    show_centers=False,
-    show_center_legend=False,
+    contrast_percentiles=BACKGROUND_CONTRAST_PERCENTILES,
+    value_column=VECTOR_VALUE_COLUMN,
+    magnitude_cmap=VECTOR_CMAP,
+    magnitude_alpha=VECTOR_ALPHA,
+    roi_outline_color=ROI_OUTLINE_COLOR,
+    roi_outline_linewidth=ROI_OUTLINE_LINEWIDTH,
+    roi_outline_alpha=ROI_OUTLINE_ALPHA,
     arrow_color=ARROW_COLOR,
     arrow_edge_color=ARROW_EDGE_COLOR,
     arrow_linewidth=ARROW_LINEWIDTH,
@@ -416,12 +446,61 @@ fig, ax = plot_cropped_group_centers_and_displacements(
     arrow_head_width=ARROW_HEAD_WIDTH,
     arrow_head_length=ARROW_HEAD_LENGTH,
     arrow_alpha=ARROW_ALPHA,
-    distance_cmap=DISTANCE_CMAP,
-    distance_alpha=DISTANCE_ALPHA,
-    interpolation_sigma_px=INTERPOLATION_SIGMA_PX,
-    show_distance_colorbar=SHOW_DISTANCE_COLORBAR,
+    vector_scale=VECTOR_SCALE,
+    vector_auto_target_fraction=VECTOR_AUTO_TARGET_FRACTION,
+    vector_auto_max_scale=VECTOR_AUTO_MAX_SCALE,
+    show_scalebar=SHOW_SCALEBAR,
+    scalebar_length_nm=SCALEBAR_LENGTH_NM,
+    scalebar_color=SCALEBAR_COLOR,
+    scalebar_linewidth=SCALEBAR_LINEWIDTH,
+    scalebar_location=SCALEBAR_LOCATION,
 )
-figures['cropped_group_center_displacement'] = fig
+
+fig, ax = plot_charge_center_displacement_map(
+    mode='raw',
+    title='Cropped raw image',
+    show_colorbar=False,
+    show_roi_outlines=False,
+    show_vector_scale_label=False,
+    **_charge_plot_common,
+)
+figures['cropped_raw_image'] = fig
+display(fig)
+plt.close(fig)
+
+fig, ax = plot_charge_center_displacement_map(
+    mode='arrows',
+    title='Charge-center displacement arrows',
+    show_colorbar=False,
+    show_roi_outlines=SHOW_ROI_OUTLINES,
+    show_vector_scale_label=SHOW_VECTOR_SCALE_LABEL,
+    **_charge_plot_common,
+)
+figures['charge_displacement_arrows'] = fig
+display(fig)
+plt.close(fig)
+
+fig, ax = plot_charge_center_displacement_map(
+    mode='magnitude',
+    title='Charge-center displacement magnitude',
+    show_colorbar=SHOW_VECTOR_COLORBAR,
+    show_roi_outlines=SHOW_ROI_OUTLINES,
+    show_vector_scale_label=False,
+    **_charge_plot_common,
+)
+figures['charge_displacement_magnitude'] = fig
+display(fig)
+plt.close(fig)
+
+fig, ax = plot_charge_center_displacement_map(
+    mode='combined',
+    title='Charge-center displacement arrows + magnitude',
+    show_colorbar=SHOW_VECTOR_COLORBAR,
+    show_roi_outlines=SHOW_ROI_OUTLINES,
+    show_vector_scale_label=SHOW_VECTOR_SCALE_LABEL,
+    **_charge_plot_common,
+)
+figures['charge_displacement_arrows_magnitude'] = fig
 display(fig)
 plt.close(fig)
 """,
@@ -475,24 +554,46 @@ FIGURE_FORMATS = FIG_STYLE.normalized_formats() if hasattr(FIG_STYLE, 'normalize
 FIGURE_DPI = FIG_STYLE.fig_dpi
 FIGURE_FONT_FAMILY = 'Arial'
 FIGURE_FONT_SIZE = 9
-
-FIG_FINAL_TITLE = 'Cropped group-center displacement'
 FIG_SHOW_TITLE = True
-FIG_SHOW_DISTANCE_COLORBAR = SHOW_DISTANCE_COLORBAR
 FIG_SHOW_SCALEBAR = SHOW_SCALEBAR
 
 FINAL_FIGURE_SPECS = {
-    'cropped_group_center_displacement': {
+    'cropped_raw_image': {
         'save': True,
-        'title': FIG_FINAL_TITLE,
+        'title': 'Cropped raw image',
         'show_title': FIG_SHOW_TITLE,
-        'show_distance_colorbar': FIG_SHOW_DISTANCE_COLORBAR,
-        'show_scalebar': FIG_SHOW_SCALEBAR,
         'font_family': FIGURE_FONT_FAMILY,
         'font_size': FIGURE_FONT_SIZE,
         'formats': FIGURE_FORMATS,
         'dpi': FIGURE_DPI,
-    }
+    },
+    'charge_displacement_arrows': {
+        'save': True,
+        'title': 'Charge-center displacement arrows',
+        'show_title': FIG_SHOW_TITLE,
+        'font_family': FIGURE_FONT_FAMILY,
+        'font_size': FIGURE_FONT_SIZE,
+        'formats': FIGURE_FORMATS,
+        'dpi': FIGURE_DPI,
+    },
+    'charge_displacement_magnitude': {
+        'save': True,
+        'title': 'Charge-center displacement magnitude',
+        'show_title': FIG_SHOW_TITLE,
+        'font_family': FIGURE_FONT_FAMILY,
+        'font_size': FIGURE_FONT_SIZE,
+        'formats': FIGURE_FORMATS,
+        'dpi': FIGURE_DPI,
+    },
+    'charge_displacement_arrows_magnitude': {
+        'save': True,
+        'title': 'Charge-center displacement arrows + magnitude',
+        'show_title': FIG_SHOW_TITLE,
+        'font_family': FIGURE_FONT_FAMILY,
+        'font_size': FIGURE_FONT_SIZE,
+        'formats': FIGURE_FORMATS,
+        'dpi': FIGURE_DPI,
+    },
 }
 """,
         ),
@@ -525,12 +626,23 @@ notebook03_configs = {
         'crop_roi': crop_table.to_dict(orient='records'),
         'measurement_rois': measurement_roi_table.to_dict(orient='records'),
         'center_groups': center_groups,
+        'center_group_class_weights': CENTER_GROUP_CLASS_WEIGHTS,
+        'center_group_weight_columns': CENTER_GROUP_WEIGHT_COLUMNS,
         'center_pairs': center_pairs,
         'min_points_per_group': MIN_POINTS_PER_GROUP,
         'show_scalebar': SHOW_SCALEBAR,
         'scalebar_color': SCALEBAR_COLOR,
         'scalebar_linewidth': SCALEBAR_LINEWIDTH,
         'scalebar_location': SCALEBAR_LOCATION,
+        'background_contrast_percentiles': BACKGROUND_CONTRAST_PERCENTILES,
+        'vector_value_column': VECTOR_VALUE_COLUMN,
+        'vector_cmap': VECTOR_CMAP,
+        'vector_alpha': VECTOR_ALPHA,
+        'show_vector_colorbar': SHOW_VECTOR_COLORBAR,
+        'show_roi_outlines': SHOW_ROI_OUTLINES,
+        'roi_outline_color': ROI_OUTLINE_COLOR,
+        'roi_outline_linewidth': ROI_OUTLINE_LINEWIDTH,
+        'roi_outline_alpha': ROI_OUTLINE_ALPHA,
         'arrow_color': ARROW_COLOR,
         'arrow_edge_color': ARROW_EDGE_COLOR,
         'arrow_linewidth': ARROW_LINEWIDTH,
@@ -539,9 +651,10 @@ notebook03_configs = {
         'arrow_head_width': ARROW_HEAD_WIDTH,
         'arrow_head_length': ARROW_HEAD_LENGTH,
         'arrow_alpha': ARROW_ALPHA,
-        'distance_cmap': DISTANCE_CMAP,
-        'distance_alpha': DISTANCE_ALPHA,
-        'interpolation_sigma_px': INTERPOLATION_SIGMA_PX,
+        'vector_scale': VECTOR_SCALE,
+        'vector_auto_target_fraction': VECTOR_AUTO_TARGET_FRACTION,
+        'vector_auto_max_scale': VECTOR_AUTO_MAX_SCALE,
+        'show_vector_scale_label': SHOW_VECTOR_SCALE_LABEL,
     }
 }
 

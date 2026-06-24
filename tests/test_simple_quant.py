@@ -355,6 +355,39 @@ def test_task3_centroids_are_unweighted_and_displacement_direction_is_a_to_b() -
     assert displacements.iloc[0]["distance_A"] == pytest.approx(np.hypot(11.0, 1.0))
 
 
+def test_task3_centroids_can_use_class_weights() -> None:
+    points = _analysis_points([0.0, 10.0, 100.0], [0.0, 0.0, 0.0], class_ids=[0, 1, 1])
+
+    centroids = compute_group_centroids_by_roi(
+        points,
+        center_groups={"A": [0, 1]},
+        center_group_class_weights={"A": {0: 1.0, 1: 2.0}},
+    )
+
+    row = centroids.iloc[0]
+    assert row["center_x"] == pytest.approx((0.0 * 1.0 + 10.0 * 2.0 + 100.0 * 2.0) / 5.0)
+    assert row["weight_mode"] == "class"
+    assert row["weight_sum"] == pytest.approx(5.0)
+    assert row["weighted_point_count"] == 3
+
+
+def test_task3_centroids_can_use_weight_column() -> None:
+    points = _analysis_points([0.0, 10.0], [0.0, 0.0], class_ids=[0, 0])
+    points["manual_weight"] = [1.0, 3.0]
+
+    centroids = compute_group_centroids_by_roi(
+        points,
+        center_groups={"A": [0]},
+        center_group_weight_columns={"A": "manual_weight"},
+    )
+
+    row = centroids.iloc[0]
+    assert row["center_x"] == pytest.approx(7.5)
+    assert row["weight_mode"] == "column:manual_weight"
+    assert row["weight_column"] == "manual_weight"
+    assert row["weight_sum"] == pytest.approx(4.0)
+
+
 def test_crop_image_and_points_by_roi_keeps_polygon_atoms_and_local_coordinates() -> None:
     image = np.arange(40 * 50, dtype=float).reshape(40, 50)
     points = _analysis_points([12.0, 18.0, 30.0], [12.0, 16.0, 30.0], class_ids=[0, 1, 1])
