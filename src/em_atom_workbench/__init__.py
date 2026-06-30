@@ -28,7 +28,7 @@ from .detect import (
     detect_multichannel_candidates,
 )
 from .export import export_results
-from .io import load_image, load_image_bundle
+from .io import load_image, load_image_bundle, load_image_stack
 from .intensity import (
     DiskIntensityConfig,
     build_disk_offsets,
@@ -37,13 +37,30 @@ from .intensity import (
     summarize_disk_intensity,
 )
 from .intensity_plotting import (
+    launch_stack_refinement_napari_viewer,
     plot_disk_aperture_preview,
     plot_disk_intensity_histogram,
     plot_disk_intensity_map,
+    plot_stack_intensity_histogram,
+    plot_stack_intensity_profiles,
+    plot_stack_refinement_shift_profile,
+    plot_stack_slice_intensity_map,
 )
+from .stack_intensity import (
+    compute_per_slice_disk_intensity_table,
+    compute_stack_disk_intensity_table,
+    summarize_stack_disk_intensity,
+)
+from .stack_refinement import refine_points_on_image, refine_stack_point_table
 from .lattice import build_neighbor_graph
 from .metrics import compute_local_metrics
-from .notebook_workflows import export_disk_intensity_analysis, initialize_disk_intensity_analysis
+from .notebook_workflows import (
+    export_disk_intensity_analysis,
+    export_notebook04_intensity_results,
+    initialize_disk_intensity_analysis,
+    initialize_notebook04_intensity_context,
+    run_notebook04_intensity_analysis,
+)
 from .polarization import (
     attach_vector_field,
     build_vector_field,
@@ -246,6 +263,8 @@ __all__ = [
     "compute_cell_geometry",
     "compute_cell_strain",
     "compute_disk_intensity_table",
+    "compute_per_slice_disk_intensity_table",
+    "compute_stack_disk_intensity_table",
     "compute_local_metrics",
     "compute_local_affine_strain",
     "compute_local_vpcf",
@@ -270,6 +289,9 @@ __all__ = [
     "flip_basis_vectors",
     "full_image_roi",
     "initialize_disk_intensity_analysis",
+    "initialize_notebook04_intensity_context",
+    "run_notebook04_intensity_analysis",
+    "export_notebook04_intensity_results",
     "launch_class_review_napari",
     "launch_napari_candidate_editor",
     "launch_detection_napari_viewer",
@@ -278,6 +300,7 @@ __all__ = [
     "launch_napari_curation",
     "load_image",
     "load_image_bundle",
+    "load_image_stack",
     "make_basis_specs_for_rois",
     "make_pair_center_points",
     "pick_basis_vectors_with_napari",
@@ -314,6 +337,11 @@ __all__ = [
     "plot_disk_aperture_preview",
     "plot_disk_intensity_histogram",
     "plot_disk_intensity_map",
+    "plot_stack_intensity_profiles",
+    "plot_stack_slice_intensity_map",
+    "plot_stack_intensity_histogram",
+    "plot_stack_refinement_shift_profile",
+    "launch_stack_refinement_napari_viewer",
     "points_for_vpcf",
     "preprocess_channels",
     "preprocess_image",
@@ -322,6 +350,8 @@ __all__ = [
     "prepare_quant_points",
     "refine_points",
     "refine_points_by_class",
+    "refine_points_on_image",
+    "refine_stack_point_table",
     "resolve_basis_vector_specs",
     "resolve_direction_specs",
     "resolve_anchor_period_references",
@@ -339,6 +369,7 @@ __all__ = [
     "translate_rois_xy",
     "suggest_annotations",
     "summarize_disk_intensity",
+    "summarize_stack_disk_intensity",
     "summarize_rois_and_points",
     "suggest_reference_lattices",
     "vector_field_from_point_matches",

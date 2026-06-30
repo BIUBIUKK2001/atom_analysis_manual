@@ -250,3 +250,319 @@ def plot_disk_intensity_histogram(
         fig.suptitle(title)
     fig.tight_layout()
     return fig, axes_flat if n_groups > 1 else axes_flat[0]
+
+
+
+def _validate_stack_for_plot(stack) -> np.ndarray:
+    arr = np.asarray(stack)
+    if arr.ndim != 3:
+        raise ValueError("stack must be a 3D array with shape (n_slices, height, width).")
+    return arr
+
+
+def _slice_filtered_table(table: pd.DataFrame | None, slice_index: int | None) -> pd.DataFrame:
+    data = table.copy() if table is not None else pd.DataFrame()
+    if slice_index is None:
+        return data
+    if "slice_index" not in data.columns:
+        raise ValueError("intensity_table must contain slice_index.")
+    slice_values = pd.to_numeric(data["slice_index"], errors="coerce")
+    return data.loc[slice_values == int(slice_index)].copy()
+
+
+def _color_for_group(group: pd.DataFrame, label: str, color_map: dict[str, str]) -> str:
+    if "class_color" in group.columns and group["class_color"].notna().any():
+        candidate = group["class_color"].dropna().astype(str).iloc[0]
+        if mcolors.is_color_like(candidate):
+            return candidate
+    return color_map.get(str(label), "#4c78a8")
+
+
+def plot_stack_intensity_profiles(
+    summary_table,
+    *,
+    metric: str = "disk_intensity_mean",
+    x: str = "slice_index",
+    group_by: str = "class_name",
+    stat: str = "mean",
+    error: str | None = "std",
+    ax=None,
+    title: str | None = None,
+):
+    """Plot per-slice intensity profiles, one curve per class/species."""
+
+    apply_publication_style()
+    data = summary_table.copy() if summary_table is not None else pd.DataFrame()
+    if "metric" in data.columns:
+        data = data.loc[data["metric"].astype(str) == str(metric)].copy()
+    for column in (x, group_by, stat):
+        if column not in data.columns:
+            raise ValueError(f"Column {column!r} is not present in summary_table.")
+    if error is not None and error not in data.columns:
+        raise ValueError(f"Error column {error!r} is not present in summary_table.")
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.2, 3.8))
+    else:
+        fig = ax.figure
+    color_map = _class_color_map(data) if not data.empty else {}
+    for label, group in data.groupby(group_by, dropna=False, sort=True):
+        group = group.sort_values(x)
+        xs = pd.to_numeric(group[x], errors="coerce")
+        ys = pd.to_numeric(group[stat], errors="coerce")
+        yerr = pd.to_numeric(group[error], errors="coerce") if error else None
+        color = _color_for_group(group, str(label), color_map)
+        ax.errorbar(xs, ys, yerr=yerr, marker="o", linewidth=1.3, markersize=3.5, capsize=2.0, label=str(label), color=color)
+    ax.set_xlabel(x)
+    ax.set_ylabel(f"{metric} {stat}")
+    if title:
+        ax.set_title(title)
+    if not data.empty:
+        ax.legend(frameon=False, fontsize=8)
+    return fig, ax
+
+
+def plot_stack_slice_intensity_map(
+    stack,
+    intensity_table,
+    *,
+    slice_index: int,
+    metric: str = "disk_intensity_mean",
+    cmap: str = "viridis",
+    point_size: float = 32,
+    show_colorbar: bool = True,
+    show_axes: bool = False,
+    title: str | None = None,
+    edgecolor_mode: str = "class",
+    fixed_edgecolor: str = "white",
+):
+    """Show one stack slice with per-atom intensity overlay."""
+
+    apply_publication_style()
+    arr = _validate_stack_for_plot(stack)
+    idx = int(slice_index)
+    if idx < 0 or idx >= arr.shape[0]:
+        raise ValueError(f"slice_index {slice_index} is out of range for stack with {arr.shape[0]} slices.")
+    data = _slice_filtered_table(intensity_table, idx)
+    if metric not in data.columns:
+        raise ValueError(f"Metric column {metric!r} is not present in intensity_table.")
+    data = _finite_xy(data)
+    data[metric] = pd.to_numeric(data[metric], errors="coerce") if metric in data.columns else np.nan
+    data = data.loc[data[metric].notna()].copy()
+
+    fig, ax = plt.subplots(figsize=(6.0, 6.0))
+    _show_image(ax, arr[idx], show_axes=show_axes)
+    if not data.empty:
+        if edgecolor_mode == "class":
+            edgecolors: Any = _edgecolors_for_class(data)
+            linewidths = 0.55
+        elif edgecolor_mode == "fixed":
+            edgecolors = fixed_edgecolor
+            linewidths = 0.45
+        elif edgecolor_mode == "none":
+            edgecolors = "none"
+            linewidths = 0.0
+        else:
+            raise ValueError("edgecolor_mode must be 'class', 'fixed', or 'none'.")
+        scatter = ax.scatter(
+            data["x_px"],
+            data["y_px"],
+            c=data[metric],
+            s=float(point_size),
+            cmap=cmap,
+            edgecolors=edgecolors,
+            linewidths=linewidths,
+            zorder=4,
+        )
+        if show_colorbar:
+            colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04)
+            colorbar.set_label(metric)
+    if title:
+        ax.set_title(title)
+    return fig, ax
+
+
+def plot_stack_intensity_histogram(
+    intensity_table,
+    *,
+    metric: str = "disk_intensity_mean",
+    slice_index: int | None = None,
+    bins: int = 30,
+    group_by_class: bool = True,
+    title: str | None = None,
+):
+    """Plot stack intensity histograms, optionally for a selected slice."""
+
+    apply_publication_style()
+    data = _slice_filtered_table(intensity_table, slice_index)
+    if metric not in data.columns:
+        raise ValueError(f"Metric column {metric!r} is not present in intensity_table.")
+    data[metric] = pd.to_numeric(data[metric], errors="coerce")
+    data = data.loc[data[metric].notna()].copy()
+    if group_by_class and "class_name" in data.columns and not data.empty:
+        groups = [(key, group.copy()) for key, group in data.groupby("class_name", dropna=False, sort=True)]
+    else:
+        groups = [("all", data)]
+
+    n_groups = max(1, len(groups))
+    fig, axes = plt.subplots(n_groups, 1, figsize=(5.8, max(3.2, 2.3 * n_groups)), squeeze=False)
+    axes_flat = axes.ravel()
+    color_map = _class_color_map(data) if not data.empty else {}
+    for ax, (key, group) in zip(axes_flat, groups, strict=False):
+        values = pd.to_numeric(group[metric], errors="coerce").dropna()
+        color = _color_for_group(group, str(key), color_map)
+        ax.hist(values, bins=int(bins), color=color, alpha=0.82, edgecolor="white", linewidth=0.5)
+        ax.set_ylabel("counts")
+        ax.set_title(str(key))
+    axes_flat[-1].set_xlabel(metric)
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig, axes_flat if n_groups > 1 else axes_flat[0]
+
+
+def plot_stack_refinement_shift_profile(
+    stack_refined_points,
+    *,
+    group_by: str = "class_name",
+    stat: str = "median",
+    error: str | None = "q25_q75",
+    ax=None,
+    title: str | None = None,
+):
+    """Plot center_shift_px versus slice_index for refined stack coordinates."""
+
+    apply_publication_style()
+    data = stack_refined_points.copy() if stack_refined_points is not None else pd.DataFrame()
+    for column in ("slice_index", "center_shift_px", group_by):
+        if column not in data.columns:
+            raise ValueError(f"Column {column!r} is not present in stack_refined_points.")
+    data["center_shift_px"] = pd.to_numeric(data["center_shift_px"], errors="coerce")
+    grouped = (
+        data.groupby(["slice_index", group_by], dropna=False, sort=True)["center_shift_px"]
+        .agg(
+            mean="mean",
+            std="std",
+            sem="sem",
+            median="median",
+            q25=lambda values: values.quantile(0.25),
+            q75=lambda values: values.quantile(0.75),
+        )
+        .reset_index()
+    )
+    if stat not in grouped.columns:
+        raise ValueError(f"stat must be one of {sorted(set(grouped.columns) - {'slice_index', group_by})}.")
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6.2, 3.8))
+    else:
+        fig = ax.figure
+    color_map = _class_color_map(data) if not data.empty else {}
+    for label, group in grouped.groupby(group_by, dropna=False, sort=True):
+        group = group.sort_values("slice_index")
+        xs = pd.to_numeric(group["slice_index"], errors="coerce")
+        ys = pd.to_numeric(group[stat], errors="coerce")
+        color = color_map.get(str(label), None)
+        ax.plot(xs, ys, marker="o", linewidth=1.3, markersize=3.5, label=str(label), color=color)
+        if error == "q25_q75":
+            q25 = pd.to_numeric(group["q25"], errors="coerce")
+            q75 = pd.to_numeric(group["q75"], errors="coerce")
+            ax.fill_between(xs, q25, q75, alpha=0.18, color=color)
+        elif error is not None:
+            if error not in group.columns:
+                raise ValueError(f"Error column {error!r} is not available.")
+            yerr = pd.to_numeric(group[error], errors="coerce")
+            ax.errorbar(xs, ys, yerr=yerr, fmt="none", capsize=2.0, color=color)
+    ax.set_xlabel("slice_index")
+    ax.set_ylabel(f"center_shift_px {stat}")
+    if title:
+        ax.set_title(title)
+    if not data.empty:
+        ax.legend(frameon=False, fontsize=8)
+    return fig, ax
+
+
+def _napari_properties(points: pd.DataFrame, columns: list[str]) -> dict[str, list[Any]]:
+    properties: dict[str, list[Any]] = {}
+    for column in columns:
+        if column in points.columns:
+            properties[column] = points[column].astype("object").where(points[column].notna(), None).tolist()
+    return properties
+
+
+def launch_stack_refinement_napari_viewer(
+    stack: np.ndarray,
+    refined_points: pd.DataFrame,
+    *,
+    seed_points: pd.DataFrame | None = None,
+    intensity_table: pd.DataFrame | None = None,
+    slice_index: int = 0,
+    point_size: float = 5.0,
+    show_seed_points: bool = True,
+    show_refined_points: bool = True,
+    color_by: str = "class_name",
+    image_name: str = "stack_slice",
+):
+    """Launch an optional napari viewer for one refined stack slice."""
+
+    try:
+        import napari
+    except ImportError as exc:  # pragma: no cover - depends on optional GUI install.
+        raise ImportError("napari is required for stack refinement review. Install em-atom-workbench[interactive] or install napari.") from exc
+
+    arr = _validate_stack_for_plot(stack)
+    idx = int(slice_index)
+    if idx < 0 or idx >= arr.shape[0]:
+        raise ValueError(f"slice_index {slice_index} is out of range for stack with {arr.shape[0]} slices.")
+    viewer = napari.Viewer()
+    viewer.add_image(arr[idx], name=image_name, colormap="gray")
+
+    refined = _slice_filtered_table(refined_points, idx)
+    if intensity_table is not None and not refined.empty:
+        intensity_slice = _slice_filtered_table(intensity_table, idx)
+        merge_keys = [key for key in ("point_id", "atom_id", "slice_index") if key in refined.columns and key in intensity_slice.columns]
+        if merge_keys and "disk_intensity_mean" in intensity_slice.columns:
+            refined = refined.merge(
+                intensity_slice[merge_keys + ["disk_intensity_mean"]].drop_duplicates(merge_keys),
+                on=merge_keys,
+                how="left",
+            )
+
+    def add_point_layers(data: pd.DataFrame, *, prefix: str, face_fallback: str, opacity: float) -> None:
+        data = _finite_xy(data)
+        if data.empty:
+            return
+        layer_groups = data.groupby(color_by, dropna=False, sort=True) if color_by in data.columns else [("all", data)]
+        for label, group in layer_groups:
+            coords = group[["y_px", "x_px"]].to_numpy(dtype=float)
+            color = face_fallback
+            if "class_color" in group.columns and group["class_color"].notna().any():
+                candidate = group["class_color"].dropna().astype(str).iloc[0]
+                if mcolors.is_color_like(candidate):
+                    color = candidate
+            properties = _napari_properties(
+                group,
+                [
+                    "atom_id",
+                    "class_id",
+                    "class_name",
+                    "center_shift_px",
+                    "center_shift_rejected",
+                    "quality_score",
+                    "refinement_path",
+                    "disk_intensity_mean",
+                ],
+            )
+            viewer.add_points(
+                coords,
+                name=f"{prefix}_{label}",
+                size=float(point_size),
+                face_color=color,
+                edge_color="white",
+                opacity=float(opacity),
+                properties=properties,
+            )
+
+    if show_seed_points and seed_points is not None:
+        add_point_layers(seed_points.copy(), prefix="seed", face_fallback="#00a5cf", opacity=0.55)
+    if show_refined_points:
+        add_point_layers(refined, prefix="refined", face_fallback="#ff9f1c", opacity=0.95)
+    return viewer

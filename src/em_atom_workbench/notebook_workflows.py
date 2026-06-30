@@ -12,7 +12,7 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from xml.sax.saxutils import escape
 
 import matplotlib.pyplot as plt
@@ -34,7 +34,7 @@ from .curate import (
     edit_hfo2_light_candidates_with_napari,
 )
 from .detect import detect_hfo2_heavy_candidates, detect_hfo2_light_candidates, detect_multichannel_candidates
-from .io import load_image_bundle
+from .io import load_image_bundle, load_image_stack
 from .plotting import (
     launch_detection_napari_viewer,
     launch_refinement_napari_viewer,
@@ -85,7 +85,13 @@ from .utils import (
     write_json,
 )
 from .figure_config import apply_figure_text_style, normalize_figure_spec
-from .intensity import prepare_disk_intensity_points
+from .intensity import compute_disk_intensity_table, prepare_disk_intensity_points, summarize_disk_intensity
+from .stack_intensity import (
+    compute_per_slice_disk_intensity_table,
+    compute_stack_disk_intensity_table,
+    summarize_stack_disk_intensity,
+)
+from .stack_refinement import refine_stack_point_table
 from .workspace import (
     AnalysisWorkspace,
     collect_project_manifest,
@@ -478,6 +484,341 @@ def initialize_disk_intensity_analysis(
         },
     }
 
+
+
+def _normalize_notebook04_input_mode(intensity_input_mode: str) -> str:
+    mode = str(intensity_input_mode).strip().lower()
+    if mode not in {"single_image", "stack"}:
+        raise ValueError("intensity_input_mode must be 'single_image' or 'stack'.")
+    return mode
+
+
+def _normalize_stack_coordinate_mode(stack_coordinate_mode: str) -> str:
+    mode = str(stack_coordinate_mode).strip().lower()
+    if mode not in {"fixed", "slice_refined"}:
+        raise ValueError("stack_coordinate_mode must be 'fixed' or 'slice_refined'.")
+    return mode
+
+
+def _resolve_notebook04_session(
+    *,
+    workspace: AnalysisWorkspace | None,
+    result_root: str | Path | None,
+    session_path: str | Path | None,
+    session_source: str,
+    use_active_session: bool,
+) -> tuple[AnalysisSession, str, Path]:
+    if workspace is not None:
+        if session_path is not None:
+            session = load_stage_session(workspace, session_source, session_path=session_path)
+            return session, "session_path", Path(session_path)
+        if use_active_session:
+            session = load_active_workspace_session(workspace)
+            return session, "active_session", workspace.state_dir / "active_session.pkl"
+        session = load_stage_session(workspace, session_source)
+        return session, "stage_session", stage_session_path(workspace, session_source)
+
+    if result_root is None:
+        raise ValueError("result_root is required when workspace is not provided.")
+    session = load_or_connect_session(result_root, session_path=session_path)
+    mode = "session_path" if session_path is not None else "legacy_active_session"
+    resolved_path = Path(session_path) if session_path is not None else Path(result_root) / "_active_session.pkl"
+    return session, mode, resolved_path
+
+
+def _resolve_stack_from_session(session: AnalysisSession, image_channel: str | None) -> tuple[np.ndarray, dict[str, Any], str | None]:
+    channel_name = image_channel or session.primary_channel
+    image = session.get_channel_state(channel_name).raw_image
+    if image is None:
+        raise ValueError("STACK_PATH is required because the selected session/channel does not contain raw stack data.")
+    arr = np.asarray(image)
+    if arr.ndim != 3:
+        raise ValueError("STACK_PATH is required because the selected session/channel raw image is not a 3D stack.")
+    metadata = {
+        "input_path": session.get_channel_state(channel_name).input_path,
+        "original_shape": tuple(arr.shape),
+        "returned_shape": tuple(arr.shape),
+        "stack_axis": 0,
+        "reader": "session.raw_image",
+    }
+    return arr, metadata, channel_name
+
+
+def _resolve_stack_slice_indices(n_slices: int, stack_slice_indices: Sequence[int] | None) -> list[int]:
+    if stack_slice_indices is None:
+        return list(range(int(n_slices)))
+    indices = [int(value) for value in stack_slice_indices]
+    invalid = [idx for idx in indices if idx < 0 or idx >= int(n_slices)]
+    if invalid:
+        raise ValueError(f"STACK_SLICE_INDICES contains invalid slice index/indices: {invalid}")
+    return indices
+
+
+def initialize_notebook04_intensity_context(
+    *,
+    workspace: AnalysisWorkspace | None = None,
+    result_root: str | Path | None = None,
+    session_path: str | Path | None = None,
+    session_source: str = "01_final_curated",
+    use_active_session: bool = False,
+    coordinate_source: str = "refined",
+    use_keep_only: bool = True,
+    class_filter: tuple[str, ...] | list[str] | set[str] | None = None,
+    class_id_filter: tuple[int, ...] | list[int] | set[int] | None = None,
+    rois: list[AnalysisROI] | tuple[AnalysisROI, ...] | None = None,
+    intensity_input_mode: str = "stack",
+    image_channel: str | None = None,
+    image_key: str = "raw",
+    stack_path: str | Path | None = None,
+    stack_axis: int = 0,
+    stack_slice_indices: Sequence[int] | None = None,
+    stack_preview_slice: int = 0,
+    manual_stack_calibration: PixelCalibration | dict[str, Any] | float | None = None,
+) -> dict[str, Any]:
+    """Initialize Notebook04 for either single-image or stack intensity analysis."""
+
+    mode = _normalize_notebook04_input_mode(intensity_input_mode)
+    if mode == "single_image":
+        context = initialize_disk_intensity_analysis(
+            session_path=session_path,
+            workspace=workspace,
+            session_source=session_source,
+            use_active_session=use_active_session,
+            result_root=result_root,
+            coordinate_source=coordinate_source,
+            use_keep_only=use_keep_only,
+            class_filter=class_filter,
+            class_id_filter=class_id_filter,
+            rois=rois,
+            image_channel=image_channel,
+            image_key=image_key,
+        )
+        context.update(
+            {
+                "intensity_input_mode": mode,
+                "stack": None,
+                "preview_image": context["image"],
+                "stack_metadata": None,
+                "stack_shape": None,
+                "stack_path": None,
+                "slice_indices": None,
+                "stack_calibration": context["session"].pixel_calibration,
+            }
+        )
+        return context
+
+    session, session_load_mode, resolved_session_path = _resolve_notebook04_session(
+        workspace=workspace,
+        result_root=result_root,
+        session_path=session_path,
+        session_source=session_source,
+        use_active_session=use_active_session,
+    )
+    points = prepare_disk_intensity_points(
+        session,
+        coordinate_source=coordinate_source,
+        use_keep_only=use_keep_only,
+        class_filter=class_filter,
+        class_id_filter=class_id_filter,
+        rois=rois,
+    )
+    if stack_path is None:
+        stack, stack_metadata, resolved_channel = _resolve_stack_from_session(session, image_channel)
+        stack_path_str = stack_metadata.get("input_path")
+        stack_calibration = session.pixel_calibration
+    else:
+        stack, stack_metadata, stack_calibration = load_image_stack(
+            stack_path,
+            stack_axis=stack_axis,
+            manual_calibration=manual_stack_calibration,
+        )
+        resolved_channel = image_channel or session.primary_channel
+        stack_path_str = str(stack_path)
+    slice_indices = _resolve_stack_slice_indices(stack.shape[0], stack_slice_indices)
+    preview_index = int(stack_preview_slice)
+    if preview_index < 0 or preview_index >= stack.shape[0]:
+        raise ValueError(f"STACK_PREVIEW_SLICE {stack_preview_slice} is out of range for stack with {stack.shape[0]} slices.")
+    output_dirs = disk_intensity_output_dirs(workspace=workspace, result_root=result_root or "results")
+    source_table = str(points.attrs.get("source_table", ""))
+    warnings_out = list(points.attrs.get("warnings", []))
+    summary = pd.DataFrame(
+        [
+            {"field": "session_name", "value": session.name},
+            {"field": "current_stage", "value": session.current_stage},
+            {"field": "session_load_mode", "value": session_load_mode},
+            {"field": "resolved_session_path", "value": str(resolved_session_path)},
+            {"field": "intensity_input_mode", "value": mode},
+            {"field": "coordinate_source", "value": coordinate_source},
+            {"field": "source_table", "value": source_table},
+            {"field": "image_channel", "value": resolved_channel},
+            {"field": "image_key", "value": image_key},
+            {"field": "stack_path", "value": stack_path_str},
+            {"field": "stack_shape", "value": tuple(stack.shape)},
+            {"field": "slice_count", "value": len(slice_indices)},
+            {"field": "point_rows", "value": len(points)},
+            {"field": "unique_points", "value": points["point_id"].nunique() if "point_id" in points else len(points)},
+            {"field": "warnings", "value": "; ".join(warnings_out)},
+            {"field": "output_dir", "value": str(output_dirs["output"])},
+        ]
+    )
+    return {
+        "session": session,
+        "workspace": workspace,
+        "output_dirs": output_dirs,
+        "points": points,
+        "image": None,
+        "stack": stack,
+        "preview_image": stack[preview_index],
+        "stack_metadata": stack_metadata,
+        "stack_shape": tuple(stack.shape),
+        "stack_path": stack_path_str,
+        "stack_calibration": stack_calibration,
+        "slice_indices": slice_indices,
+        "image_channel": resolved_channel,
+        "image_key": image_key,
+        "coordinate_source": coordinate_source,
+        "source_table": source_table,
+        "session_source": session_source,
+        "session_path": None if session_path is None else str(session_path),
+        "use_active_session": bool(use_active_session),
+        "session_load_mode": session_load_mode,
+        "resolved_session_path": str(resolved_session_path),
+        "intensity_input_mode": mode,
+        "summary_tables": {
+            "notebook04_intensity_setup_summary": summary,
+            "points_preview": points.head(),
+        },
+    }
+
+
+def run_notebook04_intensity_analysis(
+    context: dict[str, Any],
+    *,
+    intensity_input_mode: str,
+    stack_coordinate_mode: str = "slice_refined",
+    compute_fixed_coordinate_control: bool = True,
+    disk_radius_px: float,
+    refinement_config: RefinementConfig | None = None,
+    class_refinement_overrides: dict[int | str, RefinementConfig | dict[str, object]] | None = None,
+    nn_context_mode: str = "all",
+    x_offset_px: float = 0.0,
+    y_offset_px: float = 0.0,
+    stack_profile_metric: str = "disk_intensity_mean",
+) -> dict[str, Any]:
+    """Run Notebook04 single-image or stack intensity analysis from a prepared context."""
+
+    mode = _normalize_notebook04_input_mode(intensity_input_mode)
+    tables: dict[str, pd.DataFrame] = {}
+    qc_summary_tables: dict[str, pd.DataFrame] = {}
+    if mode == "single_image":
+        table = compute_disk_intensity_table(
+            context["points"],
+            context["image"],
+            disk_radius_px=disk_radius_px,
+            channel_name=context.get("image_channel"),
+            image_key=context.get("image_key", "raw"),
+            coordinate_source=context.get("coordinate_source"),
+        )
+        summary = summarize_disk_intensity(table)
+        tables["disk_intensity_table"] = table
+        tables["disk_intensity_summary"] = summary
+        qc_summary_tables["disk_intensity_summary"] = summary
+        stack_mode = None
+    else:
+        stack_mode = _normalize_stack_coordinate_mode(stack_coordinate_mode)
+        stack = context.get("stack")
+        if stack is None:
+            raise ValueError("context does not contain stack data.")
+        if stack_mode == "fixed":
+            table = compute_stack_disk_intensity_table(
+                context["points"],
+                stack,
+                disk_radius_px=disk_radius_px,
+                slice_indices=context.get("slice_indices"),
+                channel_name=context.get("image_channel"),
+                image_key=context.get("image_key", "stack"),
+                coordinate_source=context.get("coordinate_source"),
+                stack_path=context.get("stack_path"),
+                x_offset_px=x_offset_px,
+                y_offset_px=y_offset_px,
+            )
+            summary = summarize_stack_disk_intensity(table, metric=stack_profile_metric)
+            tables["stack_disk_intensity_table"] = table
+            tables["stack_disk_intensity_summary"] = summary
+            qc_summary_tables["stack_disk_intensity_summary"] = summary
+        else:
+            config = refinement_config or RefinementConfig()
+            refined_points = refine_stack_point_table(
+                context["points"],
+                stack,
+                config,
+                slice_indices=context.get("slice_indices"),
+                class_refinement_overrides=class_refinement_overrides,
+                nn_context_mode=nn_context_mode,
+                pixel_calibration=context.get("stack_calibration") or getattr(context.get("session"), "pixel_calibration", None),
+                contrast_mode=getattr(context.get("session"), "contrast_mode", "bright_peak"),
+                channel_name=str(context.get("image_channel") or "stack"),
+                source_table=str(context.get("source_table") or "seed"),
+            )
+            refined_table = compute_per_slice_disk_intensity_table(
+                refined_points,
+                stack,
+                disk_radius_px=disk_radius_px,
+                channel_name=context.get("image_channel"),
+                image_key="stack_refined",
+                coordinate_source=context.get("coordinate_source"),
+                stack_path=context.get("stack_path"),
+            )
+            refined_summary = summarize_stack_disk_intensity(refined_table, metric=stack_profile_metric)
+            tables["stack_refined_points"] = refined_points
+            tables["stack_refined_disk_intensity_table"] = refined_table
+            tables["stack_refined_disk_intensity_summary"] = refined_summary
+            qc_summary_tables["stack_refined_disk_intensity_summary"] = refined_summary
+            if "center_shift_px" in refined_points.columns:
+                shift_summary = (
+                    refined_points.assign(center_shift_px=pd.to_numeric(refined_points["center_shift_px"], errors="coerce"))
+                    .groupby("slice_index", dropna=False)["center_shift_px"]
+                    .agg(count="count", median="median", mean="mean", max="max")
+                    .reset_index()
+                )
+                qc_summary_tables["stack_refinement_shift_by_slice"] = shift_summary
+            if compute_fixed_coordinate_control:
+                fixed_table = compute_stack_disk_intensity_table(
+                    context["points"],
+                    stack,
+                    disk_radius_px=disk_radius_px,
+                    slice_indices=context.get("slice_indices"),
+                    channel_name=context.get("image_channel"),
+                    image_key="stack_fixed_control",
+                    coordinate_source=context.get("coordinate_source"),
+                    stack_path=context.get("stack_path"),
+                    x_offset_px=x_offset_px,
+                    y_offset_px=y_offset_px,
+                )
+                fixed_summary = summarize_stack_disk_intensity(fixed_table, metric=stack_profile_metric)
+                tables["stack_fixed_disk_intensity_table"] = fixed_table
+                tables["stack_fixed_disk_intensity_summary"] = fixed_summary
+                qc_summary_tables["stack_fixed_disk_intensity_summary"] = fixed_summary
+
+    config_summary = {
+        "intensity_input_mode": mode,
+        "stack_coordinate_mode": stack_mode,
+        "compute_fixed_coordinate_control": bool(compute_fixed_coordinate_control),
+        "coordinate_source": context.get("coordinate_source"),
+        "source_table": context.get("source_table"),
+        "disk_radius_px": float(disk_radius_px),
+        "stack_path": context.get("stack_path"),
+        "stack_shape": context.get("stack_shape"),
+        "slice_indices": context.get("slice_indices"),
+        "nn_context_mode": nn_context_mode,
+        "stack_profile_metric": stack_profile_metric,
+    }
+    return {
+        "tables": tables,
+        "figures": {},
+        "config_summary": config_summary,
+        "qc_summary_tables": qc_summary_tables,
+    }
 
 def initialize_simple_quant_analysis(
     *,
@@ -874,6 +1215,7 @@ def export_disk_intensity_analysis(
     session: AnalysisSession | None = None,
     intensity_table: pd.DataFrame | None = None,
     summary_table: pd.DataFrame | None = None,
+    extra_tables: dict[str, pd.DataFrame] | None = None,
     config: dict[str, Any] | None = None,
     preview_figures: dict[str, Any] | None = None,
     final_figures: dict[str, Any] | None = None,
@@ -890,6 +1232,7 @@ def export_disk_intensity_analysis(
         "disk_intensity_table": intensity_table,
         "disk_intensity_summary": summary_table,
     }
+    table_payloads.update(extra_tables or {})
     for name, table in table_payloads.items():
         if table is None:
             continue
@@ -957,6 +1300,15 @@ def export_disk_intensity_analysis(
         "coordinate_source": config_payload.get("coordinate_source"),
         "source_table": config_payload.get("source_table"),
         "disk_radius_px": config_payload.get("disk_radius_px"),
+        "intensity_input_mode": config_payload.get("intensity_input_mode"),
+        "stack_coordinate_mode": config_payload.get("stack_coordinate_mode"),
+        "compute_fixed_coordinate_control": config_payload.get("compute_fixed_coordinate_control"),
+        "stack_path": config_payload.get("stack_path"),
+        "stack_shape": config_payload.get("stack_shape"),
+        "slice_indices": config_payload.get("slice_indices"),
+        "refinement_config": config_payload.get("refinement_config"),
+        "class_refinement_overrides": config_payload.get("class_refinement_overrides"),
+        "nn_context_mode": config_payload.get("nn_context_mode"),
         "tables": table_paths,
         "figures": figure_paths,
         "preview_figures": preview_figure_paths,
@@ -986,6 +1338,62 @@ def export_disk_intensity_analysis(
         manifest["manifest"] = str(manifest_path)
     return manifest
 
+
+
+def export_notebook04_intensity_results(
+    context: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    preview_figures: dict[str, Any] | None = None,
+    final_figures: dict[str, Any] | None = None,
+    save_preview_figures: bool = False,
+    save_final_figures: bool = True,
+    figure_specs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Export all Notebook04 single-image or stack intensity outputs."""
+
+    tables = dict((result or {}).get("tables", {}) or {})
+    config_payload = dict(config or {})
+    config_payload.update((result or {}).get("config_summary", {}) or {})
+    config_payload.setdefault("session_source", context.get("session_source"))
+    config_payload.setdefault("session_path", context.get("session_path"))
+    config_payload.setdefault("use_active_session", context.get("use_active_session"))
+    config_payload.setdefault("session_load_mode", context.get("session_load_mode"))
+    config_payload.setdefault("resolved_session_path", context.get("resolved_session_path"))
+    config_payload.setdefault("coordinate_source", context.get("coordinate_source"))
+    config_payload.setdefault("source_table", context.get("source_table"))
+    config_payload.setdefault("image_channel", context.get("image_channel"))
+    config_payload.setdefault("image_key", context.get("image_key"))
+    config_payload.setdefault("stack_path", context.get("stack_path"))
+    config_payload.setdefault("stack_shape", context.get("stack_shape"))
+    config_payload.setdefault("slice_indices", context.get("slice_indices"))
+    config_payload.setdefault("intensity_input_mode", context.get("intensity_input_mode"))
+
+    primary_table = tables.get("disk_intensity_table")
+    primary_summary = tables.get("disk_intensity_summary")
+    extra_tables = {
+        name: table
+        for name, table in tables.items()
+        if name not in {"disk_intensity_table", "disk_intensity_summary"}
+    }
+    if (result or {}).get("qc_summary_tables"):
+        extra_tables.update({f"qc_{name}": table for name, table in result["qc_summary_tables"].items()})
+
+    return export_disk_intensity_analysis(
+        workspace=context.get("workspace"),
+        result_root=(Path((context.get("output_dirs") or {}).get("output")).parent if context.get("workspace") is None and (context.get("output_dirs") or {}).get("output") is not None else None),
+        session=context.get("session"),
+        intensity_table=primary_table,
+        summary_table=primary_summary,
+        extra_tables=extra_tables,
+        config=config_payload,
+        preview_figures=preview_figures,
+        final_figures=final_figures,
+        save_preview_figures=save_preview_figures,
+        save_final_figures=save_final_figures,
+        figure_specs=figure_specs,
+    )
 
 def generic_stage_summary(session: AnalysisSession, active_path: Path | None) -> pd.DataFrame:
     table = session.get_atom_table(preferred="curated")

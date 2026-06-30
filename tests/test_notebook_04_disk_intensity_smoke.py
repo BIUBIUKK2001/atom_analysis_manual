@@ -29,21 +29,62 @@ def test_build_04_disk_intensity_notebook_generates_compilable_notebook() -> Non
         "candidate",
         "refined",
         "curated",
+        "INTENSITY_INPUT_MODE",
+        "STACK_PATH",
+        "STACK_AXIS",
+        "STACK_SLICE_INDICES",
+        "STACK_COORDINATE_MODE",
+        "slice_refined",
+        "fixed",
+        "COMPUTE_FIXED_COORDINATE_CONTROL",
         "DISK_RADIUS_PX",
         "MAP_METRIC",
+        "STACK_PROFILE_METRIC",
         "HIST_BINS",
+        "REFINEMENT_CONFIG",
+        "NN_CONTEXT_MODE",
+        "CLASS_REFINEMENT_OVERRIDES",
+        "OPEN_STACK_REFINEMENT_VIEWER",
+        "NAPARI_REVIEW_SLICE_INDEX",
         "SAVE_PREVIEW_FIGURES",
         "SAVE_FINAL_FIGURES",
     ):
         assert parameter in joined
 
-    assert "initialize_disk_intensity_analysis" in joined
-    assert "compute_disk_intensity_table" in joined
-    assert "plot_disk_intensity_map" in joined
-    assert "plot_disk_intensity_histogram" in joined
-    assert "export_disk_intensity_analysis" in joined
+    for api_name in (
+        "initialize_disk_intensity_analysis",
+        "initialize_notebook04_intensity_context",
+        "run_notebook04_intensity_analysis",
+        "export_disk_intensity_analysis",
+        "export_notebook04_intensity_results",
+        "compute_disk_intensity_table",
+        "compute_stack_disk_intensity_table",
+        "compute_per_slice_disk_intensity_table",
+        "summarize_stack_disk_intensity",
+        "plot_disk_intensity_map",
+        "plot_disk_intensity_histogram",
+        "plot_stack_intensity_profiles",
+        "plot_stack_slice_intensity_map",
+        "plot_stack_intensity_histogram",
+        "plot_stack_refinement_shift_profile",
+        "launch_stack_refinement_napari_viewer",
+    ):
+        assert api_name in joined
+
+    for table_name in (
+        "stack_refined_points",
+        "stack_refined_disk_intensity_table",
+        "stack_refined_disk_intensity_summary",
+        "stack_fixed_disk_intensity_table",
+        "stack_fixed_disk_intensity_summary",
+        "center_shift_rejected",
+        "refinement_path",
+    ):
+        assert table_name in joined
+
     assert "04_intensity_mapping" in joined
     assert "vacancy threshold" in joined
+    assert "stack registration" in joined
 
     for cell in notebook.get("cells", []):
         assert cell.get("id")

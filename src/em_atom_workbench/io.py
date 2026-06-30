@@ -282,6 +282,189 @@ def _load_image_components(path: str | Path, dataset_index: int | None = None) -
     return image, metadata, calibration, selected_dataset_index
 
 
+
+def _coerce_to_3d_stack(stack: np.ndarray, *, stack_axis: int) -> np.ndarray:
+    data = np.squeeze(np.asarray(stack))
+    if data.ndim != 3:
+        raise ValueError(f"Stack data must be 3D after squeezing singleton dimensions. Received shape {data.shape}.")
+    axis = int(stack_axis)
+    if axis < 0:
+        axis += data.ndim
+    if axis < 0 or axis >= data.ndim:
+        raise ValueError(f"stack_axis {stack_axis!r} is out of range for shape {data.shape}.")
+    return np.moveaxis(data, axis, 0)
+
+
+def _select_npz_array(loaded: Any, dataset_index: int | None) -> tuple[np.ndarray, dict[str, Any], int | None]:
+    keys = list(loaded.files)
+    if not keys:
+        raise ValueError("NPZ file does not contain any arrays.")
+    if dataset_index is None:
+        if len(keys) != 1:
+            raise ValueError(
+                "NPZ file contains multiple arrays. Please specify dataset_index. "
+                f"Available arrays: {', '.join(keys)}"
+            )
+        selected_index = 0
+    else:
+        selected_index = int(dataset_index)
+        if selected_index < 0 or selected_index >= len(keys):
+            raise IndexError(f"dataset_index {dataset_index} is out of range for {len(keys)} NPZ arrays.")
+    key = keys[selected_index]
+    return np.asarray(loaded[key]), {"npz_arrays": keys, "npz_selected_key": key}, selected_index
+
+
+def _select_hyperspy_stack_signal(loaded: Any, dataset_index: int | None) -> tuple[Any, int | None]:
+    if not isinstance(loaded, (list, tuple)):
+        return loaded, dataset_index
+
+    if dataset_index is not None:
+        if dataset_index < 0 or dataset_index >= len(loaded):
+            raise IndexError(f"dataset_index {dataset_index} is out of range for {len(loaded)} loaded datasets.")
+        return loaded[int(dataset_index)], int(dataset_index)
+
+    candidates = [
+        (idx, signal)
+        for idx, signal in enumerate(loaded)
+        if np.squeeze(np.asarray(getattr(signal, "data", np.empty((0, 0, 0))))).ndim == 3
+    ]
+    if len(candidates) == 1:
+        idx, signal = candidates[0]
+        return signal, int(idx)
+
+    descriptions = []
+    for idx, signal in enumerate(loaded):
+        shape = getattr(getattr(signal, "data", None), "shape", None)
+        signal_dimension = getattr(getattr(signal, "axes_manager", None), "signal_dimension", None)
+        descriptions.append(f"{idx}: shape={shape}, signal_dimension={signal_dimension}")
+    raise ValueError(
+        "Multiple datasets were found in the DM file or no unique 3D stack dataset was found. "
+        "Please specify dataset_index in the notebook config. "
+        f"Available datasets: {'; '.join(descriptions)}"
+    )
+
+
+def _extract_hyperspy_stack(path: Path, dataset_index: int | None = None) -> tuple[np.ndarray, dict[str, Any], PixelCalibration, int | None]:
+    try:
+        import hyperspy.api as hs
+    except ImportError as exc:
+        raise ImportError("DM3/DM4 stack loading requires hyperspy and rosettasciio.") from exc
+
+    loaded = hs.load(str(path))
+    signal, selected_dataset_index = _select_hyperspy_stack_signal(loaded, dataset_index)
+    data = np.asarray(signal.data)
+    metadata_dict = _safe_metadata_value(signal.metadata.as_dictionary())
+    original_metadata_dict = _safe_metadata_value(signal.original_metadata.as_dictionary())
+    metadata = {
+        "metadata": metadata_dict,
+        "original_metadata": original_metadata_dict,
+        "dataset_index": selected_dataset_index,
+    }
+
+    calibration = _calibration_from_signal_axes(signal)
+    if calibration is None:
+        calibration = _calibration_from_dm_original_metadata(original_metadata_dict)
+    if calibration is None:
+        calibration = PixelCalibration(size=None, unit="px", source="metadata_missing")
+    return data, metadata, calibration, selected_dataset_index
+
+
+def load_image_stack(
+    path: str | Path,
+    *,
+    dataset_index: int | None = None,
+    stack_axis: int = 0,
+    manual_calibration: PixelCalibration | dict[str, Any] | float | None = None,
+) -> tuple[np.ndarray, dict[str, Any], PixelCalibration]:
+    """Load a 3D image stack and normalize it to (n_slices, height, width)."""
+
+    image_path = Path(path)
+    suffix = image_path.suffix.lower()
+    selected_dataset_index = dataset_index
+    reader_metadata: dict[str, Any] = {}
+
+    if suffix == ".npy":
+        raw_stack = np.load(image_path, allow_pickle=False)
+        reader = "numpy.load"
+        calibration = PixelCalibration(size=None, unit="px", source="metadata_missing")
+    elif suffix == ".npz":
+        with np.load(image_path, allow_pickle=False) as loaded:
+            raw_stack, reader_metadata, selected_dataset_index = _select_npz_array(loaded, dataset_index)
+        reader = "numpy.load"
+        calibration = PixelCalibration(size=None, unit="px", source="metadata_missing")
+    elif suffix in {".tif", ".tiff"}:
+        with tifffile.TiffFile(image_path) as tif:
+            raw_stack = tif.asarray()
+            reader_metadata = {
+                "tiff_pages": len(tif.pages),
+                "tiff_tags": {
+                    tag.name: _safe_metadata_value(tag.value)
+                    for tag in tif.pages[0].tags.values()
+                },
+                "ome_metadata": _safe_metadata_value(getattr(tif, "ome_metadata", None)),
+            }
+            calibration = PixelCalibration()
+            x_resolution = tif.pages[0].tags.get("XResolution")
+            resolution_unit = tif.pages[0].tags.get("ResolutionUnit")
+            if x_resolution is not None and resolution_unit is not None:
+                try:
+                    numerator, denominator = x_resolution.value
+                    pixels_per_unit = numerator / denominator
+                    if pixels_per_unit > 0:
+                        calibration = PixelCalibration(
+                            size=1.0 / pixels_per_unit,
+                            unit=str(resolution_unit.value),
+                            source="tiff_resolution",
+                        )
+                except Exception:
+                    calibration = PixelCalibration()
+        reader = "tifffile.TiffFile.asarray"
+    elif suffix == ".mrc":
+        with mrcfile.open(image_path, permissive=True) as handle:
+            raw_stack = np.asarray(handle.data)
+            voxel_size = getattr(handle, "voxel_size", None)
+            voxel_x = getattr(voxel_size, "x", None)
+            voxel_y = getattr(voxel_size, "y", None)
+            voxel_z = getattr(voxel_size, "z", None)
+            pixel_size = _coerce_optional_float(voxel_x)
+            reader_metadata = {
+                "header": _mrc_header_to_dict(handle.header),
+                "voxel_size": _safe_metadata_value({"x": voxel_x, "y": voxel_y, "z": voxel_z}),
+            }
+            calibration = PixelCalibration(size=pixel_size, unit="A", source="mrc_voxel_size" if pixel_size else "metadata_missing")
+        reader = "mrcfile.open"
+    elif suffix in {".dm3", ".dm4"}:
+        raw_stack, reader_metadata, calibration, selected_dataset_index = _extract_hyperspy_stack(
+            image_path,
+            dataset_index=dataset_index,
+        )
+        reader = "hyperspy.load"
+    else:
+        raise ValueError(
+            "Unsupported stack file type. Supported stack formats are .npy, .npz, .tif, .tiff, .mrc, .dm3, and .dm4."
+        )
+
+    original_shape = tuple(np.asarray(raw_stack).shape)
+    stack = _coerce_to_3d_stack(raw_stack, stack_axis=stack_axis)
+    manual = _manual_calibration_to_object(manual_calibration)
+    if not calibration.is_calibrated and manual.size is not None:
+        calibration = manual
+    elif not calibration.is_calibrated:
+        calibration = PixelCalibration(size=None, unit="px", source="metadata_missing")
+
+    metadata = {
+        **reader_metadata,
+        "input_path": str(image_path),
+        "original_shape": original_shape,
+        "returned_shape": tuple(stack.shape),
+        "stack_axis": int(stack_axis),
+        "reader": reader,
+    }
+    if selected_dataset_index is not None:
+        metadata["selected_dataset_index"] = int(selected_dataset_index)
+    return stack, metadata, calibration
+
+
 def _merge_bundle_calibration(
     calibrations: dict[str, PixelCalibration],
     manual_calibration: PixelCalibration | dict[str, Any] | float | None,
